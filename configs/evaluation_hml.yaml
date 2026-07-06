@@ -1,0 +1,21 @@
+device: 'cuda:0'
+
+# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
+which_ckpt: 'net_best_fid.tar'
+
+# Sampling params — official MoMask++ values
+time_steps: [20]
+cond_scales: [3]
+video_emphasis: 0.0
+temperature: 1
+topkr: 0.9
+gsample: True
+
+# Conditioning dropout at eval: 0=use, 1=drop
+t_drop: 0
+v_drop: 0
+
+cal_mm: False
+repeat_time: 20
+
+ext: 'eval_hml_cs5_ts16'

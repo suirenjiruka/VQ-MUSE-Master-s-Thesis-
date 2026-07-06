@@ -1,0 +1,29 @@
+device: 'cuda:0'
+
+# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
+which_ckpt: 'test/latest.tar'
+stage_dir: 'VA_motion'
+
+# Data split and task switches
+split: 'test'
+eval_generation: True
+eval_editing: True
+edit_eval_wrapper: 'tmr'
+motionfix_start_id: 400000
+
+# Dataloader
+batch_size: 32
+num_workers: 0
+
+# Sampling params
+time_steps: [16]
+cond_scales: [2]
+source_cond_scale: 1.0  # legacy, no-op for text-only CFG
+source_hint_ratio: 0.2
+temperature: 1
+topkr: 0.9
+gsample: True
+repeat_time: 1
+
+# Log filename prefix
+ext: 'eval_motion_editing_hml'

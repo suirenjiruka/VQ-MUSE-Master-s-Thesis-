@@ -1,0 +1,31 @@
+/renamed_bvhs
+/renamed_feats
+
+# local outputs / checkpoints
+/_codex_backups/
+/checkpoint_dir/
+/visualize/
+/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tmp
+
+# datasets / local assets
+/glove/
+/pr_vipe_models/
+/poem/
+*.gif
+*.mp4
+*.avi
+*.png
+*.jpg
+*.jpeg
+
+# model weights / installers
+*.pt
+*.pth
+*.tar
+*.ckpt
+*.deb

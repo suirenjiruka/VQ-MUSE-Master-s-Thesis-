@@ -1,0 +1,128 @@
+exp:
+  root_ckpt_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir'
+  root_log_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/log'
+  model_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir'
+  evaluator_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/snapmogen/evaluator/eval_klde-5_late-5_nlayer6_norm/evaluator.yaml'
+  # name: 'mask_nlayer8_cdp0.1_rvq_nsplit_148'
+  name: 'hml_momaskplus_hrvq5_nlayer8_cdp0.1_ic'
+  device: 'cuda:0'
+  is_continue: False
+  is_train: True
+  #video_stage: False
+  seed: 10306
+
+debug:
+  open: false
+
+vq_cfg_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project'
+vq_name: 'residual_vqvae_hml.yaml' # vq3
+vq_ckpt: 'net_best_fid.tar'
+
+# vq_name: "hml_hrvq_nq4_263_nb1024_fk0_gl0_ex0.5_attn" #vq6
+#vq_name: "hml_hrvq_nq4_263_nb512_fk0_gl0_ex0.5_attn" # vq5
+# vq_name: 'hml_hrvq_nq4_263_nb2048_fk0_gl0_ex0.5_attn' #vq7
+# vq_ckpt: "latest.tar"
+vq_ckpt: "net_best_fid.tar"
+
+vipe_checkpt: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/pr_vipe_models/model.ckpt-02059146'
+
+data:
+  name: 'humanml3d'
+  unit_length: 4
+  root_dir: '/home/imlab/HumanML3D/repo'
+  feat_dir: '/home/imlab/HumanML3D/repo/HumanML3D/new_joint_vecs'
+  feat2D_dir: '/home/imlab/HumanML3D/repo/HumanML3D/yolo_format_13js'
+  joint_num: 22
+  dim_pose: 263 #296 #here we use all features
+  fps: 20
+  max_motion_length: 196
+  motion_length: 128
+  max_text_length: 20
+  min_motion_length: 40
+
+
+text_embedder:
+  dim_embed: 1024  # google/t5-v1_1-base: 768,  google/t5-v1_1-large later: unchecked
+  version: 'google/flan-t5-large' # try google/t5-v1_1-base (origin) & google/t5-v1_1-large later
+  # dim_embed: 512
+  # version: 'ViT-B/32'
+
+video_embedder:
+  # legacy fields kept for old constructors; editing model uses source motion tokens instead
+  vipe_dim: 19
+  TCN_dim: 128
+  joint_dim: 30
+
+
+  # base: ld384, ff1024, nlayer8, nhead6, bs64
+  # medium: ld512, ff2048, nlayer12, nhead8, bs64
+  # large: ld768, ff3072, nlayer12, nhead12, bs32
+model:
+  latent_dim: 384
+  # latent_dim: 512
+  ff_size: 1024
+  # ff_size: 512
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.1
+  fuse_mode: 'cross_attention'
+  use_abs_pe: True
+  use_toa_pe: False
+  use_lvl_pe: False
+  use_task_token: False
+  use_cond_delta: False
+  text_delta_init: 1.0
+  source_delta_init: 1.0
+  use_vq_delta: True
+  delta_alpha: 0.2   # latent logits scale
+  delta_beta: 0.5    # layer-wise delta residual scale
+  delta_temp: 0.1
+  # fuse_mode: 'in_context'
+
+
+training:
+  batch_size: 64
+  max_epoch: 500
+  cond_drop_prob: 0.1
+  weight_decay: 0.0
+  pert_prob: 0.1
+  lr: 1.5e-4
+  milestones: [100_000, 150_000]
+  gamma: 0.3
+  warm_up_iter: 2000
+  log_every: 10
+  save_latest: 500
+  eval_every_e: 1
+  gumbel_sample: True
+  ema_decay: 0.999
+  # CFG / corruption
+  m_drop: 0.1  # target full mask
+  v_drop: 0.0  # legacy, no source CFG drop
+  t_drop: 0.1  # text CFG drop
+  s_drop: 0.0  # source token drop
+  src_fill_prob: 0.1  # source inpainting corruption: fraction of masked slots that show the aligned source token
+
+loss:
+  weight_transformer_loss: 1.0
+  weight_motion_text_InfoNCE: 0.2
+  weight_delta: 0.1
+  weight_latent: 0.05
+  #weight_edit_map: 0.5
+
+inference:
+  ext: 'pool_32'
+  matching_pool_size: 32   # HML3D standard protocol (Guo, pool=32); SnapMoGen-dataset runs use 100
+  name: 'eval_klde-5_late-5_nlayer6'
+  device: 'cuda:0'
+  repeat_time: 20
+  edit_eval_wrapper: 'tmr'   # G2T/G2S in TMR space (MotionFix protocol); 'hml' = Guo encoder (internal trend only)
+  source_cond_scale: 1.0
+  edit_cond_scale: 2   # edit monitor guidance
+  source_hint_ratio: 0.1   # first denoising step only; current-code equivalent of old source_init_ratio
+
+
+tmr:
+  root: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/TMR'
+  run_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/TMR/models/tmr_humanml3d_guoh3dfeats'
+  ckpt_name: 'last'
+  input_is_normalized: True
