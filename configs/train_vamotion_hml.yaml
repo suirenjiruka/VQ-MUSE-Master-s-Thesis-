@@ -69,7 +69,6 @@ model:
   use_abs_pe: True
   use_toa_pe: True
   use_lvl_pe: False
-  use_task_token: False
   # fuse_mode: 'in_context'
 
 
@@ -93,7 +92,6 @@ training:
   v_drop: 0.1  # source CFG drop
   t_drop: 0.1  # text CFG drop
   s_drop: 0.0  # source token drop
-  src_fill_prob: 0.0  # no train-time source fill in 9am recovery
 
 loss:
   weight_transformer_loss: 1.0
@@ -107,9 +105,8 @@ inference:
   repeat_time: 20
   edit_eval_wrapper: 'tmr'   # G2T/G2S in TMR space (MotionFix protocol); 'hml' = Guo encoder (internal trend only)
   source_cond_scale: 1.0
-  edit_cond_scale: 2   # edit monitor guidance
-  source_hint_ratio: 0.1   # first denoising step only; current-code equivalent of old source_init_ratio
-
+  edit_cond_scale: 2   # edit monitor guidance; 4 turns dual CFG into 4C-3B and amplifies the undertrained B branch
+  # model_name: "best"
 
 tmr:
   root: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/TMR'

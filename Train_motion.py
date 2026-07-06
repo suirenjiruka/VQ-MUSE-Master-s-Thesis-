@@ -98,14 +98,14 @@ if __name__ == '__main__':
                         type=str,
                         default='source',
                         choices=['source', 'text'],
-                        help='kept for old CLI; source baseline is the active path')
+                        help='kept for old CLI; only source-stage training is active')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     if args.max_epoch is not None:
         cfg.training.max_epoch = args.max_epoch
     if args.stage != 'source':
-        print("stage=text is disabled; use source-branch baseline")
+        print("stage=text is disabled; keep source-branch stage only")
         args.stage = 'source'
     stage_dirname = 'VA_motion'
     cfg.exp.checkpoint_dir = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, stage_dirname)
@@ -125,8 +125,6 @@ if __name__ == '__main__':
         vq_cfg_path = pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name)
         os.makedirs(cfg.exp.checkpoint_dir, exist_ok=True)
         shutil.copy(args.config, cfg.exp.checkpoint_dir)
-
-    print(f"loss weights: CE={cfg.loss.weight_transformer_loss}, InfoNCE={cfg.loss.weight_motion_text_InfoNCE}")
 
     fixseed(cfg.exp.seed)
 
@@ -189,7 +187,7 @@ if __name__ == '__main__':
     print(f"num of transformer parameter: {pc_vq / 1000} k")
 
     n_trainable = sum(p.numel() for p in TV2m_transformer.parameters() if p.requires_grad)
-    print(f"trainable parameter: {n_trainable / 1000} k")
+    print(f"stage: {args.stage}, trainable parameter: {n_trainable / 1000} k")
 
     trainer = VA_motion_trainer(cfg, vq_model=vq_model, va_transformer=TV2m_transformer, eval_wrapper=eval_wrapper,
                                 edit_eval_wrapper=edit_eval_wrapper, device=device)
@@ -225,6 +223,6 @@ if __name__ == '__main__':
     val_loader = DataLoader(val_dataset, batch_size=cfg.training.batch_size, drop_last=True, num_workers=8, shuffle=True, pin_memory=True, collate_fn=loader_collate_fn)
     # batch 32 = MotionFix batch-protocol pool for edit G2T/G2S retrieval
     eval_loader = DataLoader(edit_eval_dataset, batch_size=32, drop_last=False, num_workers=8, shuffle=False, pin_memory=True, collate_fn=loader_collate_fn)
-    gen_eval_loader = DataLoader(gen_eval_dataset, batch_size=cfg.inference.matching_pool_size, drop_last=True, num_workers=8, shuffle=False, pin_memory=True, collate_fn=loader_collate_fn)
+    gen_eval_loader = DataLoader(gen_eval_dataset, batch_size=cfg.inference.matching_pool_size, drop_last=True, num_workers=8, shuffle=True, pin_memory=True, collate_fn=loader_collate_fn)
 
     trainer.train(train_loader=train_loader, val_loader=val_loader, eval_loader=eval_loader, gen_eval_loader=gen_eval_loader)

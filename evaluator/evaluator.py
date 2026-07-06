@@ -23,7 +23,7 @@ def get_motion_embeddings_aligned(eval_wrapper, motions, m_lens):
     return emb[inv_idx]
 
 @torch.no_grad()
-def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=1.0, text_delta_scale=1.0, unit_length=4, temperature=1,
+def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=1.0, unit_length=4, temperature=1,
                                     topk_filter_thres=0.95, gsample=True, draw=True):
     trans.eval()
     vq_model.eval()
@@ -54,7 +54,7 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
 
         mids = trans.generate(
             None, caption, m_length // unit_length, gen_has_source, t_drop=0,
-            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, text_delta_scale=text_delta_scale, temperature=temperature,
+            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
@@ -116,7 +116,7 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
     return metrics
 
 @torch.no_grad()
-def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=1.0, text_delta_scale=1.0, unit_length=4, temperature=1,
+def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=1.0, unit_length=4, temperature=1,
                               topk_filter_thres=0.95, gsample=True, draw=True):
     trans.eval()
     vq_model.eval()
@@ -134,7 +134,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
 
         mids = trans.generate(
             None, caption, m_length // unit_length, gen_has_source, t_drop=0,
-            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, text_delta_scale=text_delta_scale, temperature=temperature,
+            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
@@ -187,8 +187,8 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
     return metrics
 
 @torch.no_grad()
-def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=2.0, text_delta_scale=1.0, unit_length=4, temperature=1,
-                                  topk_filter_thres=0.95, gsample=True, draw=True, source_hint_ratio=0.0):
+def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval_wrapper, device, time_steps=10, cond_scale=4, source_cond_scale=2.0, unit_length=4, temperature=1,
+                                  topk_filter_thres=0.95, gsample=True, draw=True):
     trans.eval()
     vq_model.eval()
 
@@ -221,8 +221,7 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
         mids = trans.generate(
             source_code_idx, caption, m_length // unit_length, edit_has_source, t_drop=0,
             timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale,
-            source_m_lens=src_m_length // unit_length, text_delta_scale=text_delta_scale,
-            source_hint_ratio=source_hint_ratio, temperature=temperature,
+            source_m_lens=src_m_length // unit_length, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())

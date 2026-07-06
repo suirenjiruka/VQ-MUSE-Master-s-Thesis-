@@ -1,12 +1,9 @@
 import torch
 import math
-import random
-import numpy as np
 from tqdm import tqdm
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter 
 from os.path import join as pjoin
-from contextlib import contextmanager
 from transformers import get_cosine_schedule_with_warmup
 from evaluator.evaluator import evaluation_generation_hml, evaluation_generation_hml_mixed, evaluation_motion_editing_hml
 from SnapMogen_model.transformer.tools import *
@@ -14,27 +11,6 @@ from SnapMogen_model.transformer.tools import *
 '''
 Training code is borrowed from the framework of SnapMogen, including VQ-model, traing process, and most relatted configuratioon
 '''
-
-@contextmanager
-def fixed_eval_seed(seed):
-    # keep eval stochasticity comparable without changing the following train RNG stream
-    py_state = random.getstate()
-    np_state = np.random.get_state()
-    torch_state = torch.random.get_rng_state()
-    cuda_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    try:
-        yield
-    finally:
-        random.setstate(py_state)
-        np.random.set_state(np_state)
-        torch.random.set_rng_state(torch_state)
-        if cuda_state is not None:
-            torch.cuda.set_rng_state_all(cuda_state)
 
 class VA_motion_trainer:
     def __init__(self, cfg, vq_model, va_transformer, eval_wrapper, device, edit_eval_wrapper=None):
@@ -49,8 +25,8 @@ class VA_motion_trainer:
         self.device = device
         lr = float(cfg.training.lr)
         weight_decay = float(cfg.training.weight_decay)
-        param_groups = [p for p in self.training_model.parameters() if p.requires_grad]
-        self.optimizer = optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
+        # frozen branches (two-stage plan) stay out of the optimizer; also keeps optimizer state resume-compatible
+        self.optimizer = optim.AdamW([p for p in self.training_model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
         # setup logger
         self.logger = SummaryWriter(cfg.exp.log_dir)
 
@@ -117,16 +93,14 @@ class VA_motion_trainer:
             checkpoint = torch.load(model_dir, map_location=self.device, weights_only=True)
 
             _, unexpected_keys = self.training_model.load_state_dict(checkpoint['training_model'], strict=False)
-            old_keys = ("text_delta_encoder.", "condition_encoder.", "edit_map_head.",
-                        "part_gate_mlp.", "part_cond_mlp.", "part_text_mlp.", "part_source_mlp.",
-                        "edit_loc_head.", "task_embed.", "text_delta_scale", "source_delta_scale")
+            old_keys = ("text_delta_encoder.", "edit_map_head.")
             unexpected_keys = [k for k in unexpected_keys if not k.startswith(old_keys)]
             assert len(unexpected_keys) == 0
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer']) # Optimizer
-                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler']) # Scheduler
-            except ValueError as e:
-                print(f"skip optimizer resume: {e}")
+            except ValueError:
+                print("optimizer state is incompatible with current trainable params; reset optimizer")
+            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler']) # Scheduler
             epoch = checkpoint['epoch']
 
             del checkpoint
@@ -215,26 +189,21 @@ class VA_motion_trainer:
                 self.logger.add_scalar('Val/loss', val_loss, epoch)
                 self.logger.add_scalar('Val/acc', val_acc, epoch)
             
-            with fixed_eval_seed(getattr(self.config.exp, "seed", 3407) + 999):
-                gen_eval_fn = evaluation_generation_hml if gen_eval_loader is not None else evaluation_generation_hml_mixed
-                gen_metrics = gen_eval_fn(
-                    gen_eval_loader if gen_eval_loader is not None else eval_loader,
-                    self.training_model, self.vq_model, self.logger, epoch,
-                    eval_wrapper=self.eval_wrapper, device=self.device,
-                    time_steps=10, cond_scale=4, source_cond_scale=getattr(self.config.inference, "source_cond_scale", 1.0),
-                    text_delta_scale=getattr(self.config.inference, "text_delta_scale", 1.0), unit_length=self.config.data.unit_length,
-                    temperature=1, topk_filter_thres=0.95, gsample=self.config.training.gumbel_sample
-                )
-                eval_metrics = evaluation_motion_editing_hml(
-                    eval_loader, self.training_model, self.vq_model, self.logger, epoch,
-                    eval_wrapper=self.edit_eval_wrapper, device=self.device,
-                    # dual CFG: source branch + text edit branch
-                    time_steps=10, cond_scale=getattr(self.config.inference, "edit_cond_scale", 2),
-                    source_cond_scale=getattr(self.config.inference, "source_cond_scale", 1.0),
-                    text_delta_scale=getattr(self.config.inference, "text_delta_scale", 1.0), unit_length=self.config.data.unit_length,
-                    source_hint_ratio=getattr(self.config.inference, "source_hint_ratio", 0.0),
-                    temperature=1, topk_filter_thres=0.95, gsample=self.config.training.gumbel_sample
-                )
+            gen_eval_fn = evaluation_generation_hml if gen_eval_loader is not None else evaluation_generation_hml_mixed
+            gen_metrics = gen_eval_fn(
+                gen_eval_loader if gen_eval_loader is not None else eval_loader,
+                self.training_model, self.vq_model, self.logger, epoch,
+                eval_wrapper=self.eval_wrapper, device=self.device,
+                time_steps=10, cond_scale=4, source_cond_scale=getattr(self.config.inference, "source_cond_scale", 1.0), unit_length=self.config.data.unit_length,
+                temperature=1, topk_filter_thres=0.95, gsample=self.config.training.gumbel_sample
+            )
+            eval_metrics = evaluation_motion_editing_hml(
+                eval_loader, self.training_model, self.vq_model, self.logger, epoch,
+                eval_wrapper=self.edit_eval_wrapper, device=self.device,
+                # edit dual CFG expands to cond*C - (cond-source)*B; cond=4 extrapolates the undertrained B branch 3x -> off-manifold FID spikes
+                time_steps=10, cond_scale=getattr(self.config.inference, "edit_cond_scale", 2), source_cond_scale=getattr(self.config.inference, "source_cond_scale", 1.0), unit_length=self.config.data.unit_length,
+                temperature=1, topk_filter_thres=0.95, gsample=self.config.training.gumbel_sample
+            )
             if eval_metrics is not None:
                 improve_g2t = eval_metrics["g2t_r1"] > best_g2t_r1
                 tie_break = eval_metrics["g2t_r1"] == best_g2t_r1 and eval_metrics["g2t_avgr"] < best_g2t_avgr

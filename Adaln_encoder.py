@@ -73,16 +73,12 @@ class AdaLN_ControlBranch(nn.Module):
             nn.init.zeros_(proj.weight)
             nn.init.zeros_(proj.bias)
 
-    def forward(self, x, control, cond, padding_mask=None, return_hiddens=False):
+    def forward(self, x, control, cond, padding_mask=None):
         c = x + self.zero_in(control)
         residuals = []
-        hiddens = []
         for layer, zero_proj in zip(self.layers, self.zero_projs):
             c = layer(c, cond, padding_mask)
-            hiddens.append(c)
             residuals.append(zero_proj(c))
-        if return_hiddens:
-            return residuals, hiddens
         return residuals   # [r_1 ... r_L], depth-matched to the main blocks
 
 

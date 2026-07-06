@@ -51,30 +51,16 @@ def load_vq_model(trans_cfg, device):
     return vq_model.to(device).eval(), vq_cfg
 
 
-def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, stage_dir='VA_motion'):
+def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device):
     # Load current motion editing transformer; no video/joint condition is used
     trans_cfg.vq = vq_cfg.quantizer
     trans_cfg.vq.nb_code = vq_cfg.quantizer.nb_code
-
-    model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, stage_dir, 'model')
-    ckpt_path = pjoin(model_dir, ckpt_name)
-    trans_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    state = trans_ckpt['training_model']
-
-    # old ckpt compatibility
-    if 'task_embed.weight' not in state:
-        trans_cfg.model.use_task_token = False
     trans = VAMotion(cfg=trans_cfg, device=device, full_length=trans_cfg.data.max_motion_length // trans_cfg.data.unit_length)
 
-    state = {k: v for k, v in state.items() if not k.startswith('text_emb.')}
-    missing, unexpected = trans.load_state_dict(state, strict=False)
-    old_keys = ('text_delta_encoder.', 'condition_encoder.', 'edit_map_head.',
-                'part_gate_mlp.', 'part_cond_mlp.', 'part_text_mlp.', 'part_source_mlp.',
-                'edit_loc_head.', 'task_embed.', 'text_delta_scale', 'source_delta_scale')
-    unexpected = [k for k in unexpected if not k.startswith(old_keys)]
-    if missing:
-        print(f'missing keys from ckpt: {missing[:5]}')
-    assert len(unexpected) == 0, f"unexpected keys from ckpt: {unexpected[:5]}"
+    model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'model')
+    ckpt_path = pjoin(model_dir, ckpt_name)
+    trans_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    trans.load_state_dict(trans_ckpt['training_model'])
     print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")})')
     return trans.to(device).eval()
 
@@ -141,14 +127,12 @@ def build_editing_loader(trans_cfg, hml3d_opt, mean, std, split, batch_size, num
 
 @torch.no_grad()
 def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device, time_steps=10,
-                              cond_scale=4, source_cond_scale=1.0, text_delta_scale=1.0, unit_length=4, temperature=1, topk_filter_thres=0.95,
+                              cond_scale=4, source_cond_scale=1.0, unit_length=4, temperature=1, topk_filter_thres=0.95,
                               gsample=True):
     trans.eval()
     vq_model.eval()
 
     text_emb_list, gt_emb_list, pred_emb_list = [], [], []
-    r_precision_sum = np.zeros(3)
-    matching_sum = 0.0
     nb_sample = 0
 
     for batch in tqdm(eval_loader):
@@ -161,18 +145,13 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         # Generate with null source condition, which is the generation branch of the current model
         mids = trans.generate(
             None, clip_text, m_length // unit_length, has_source, t_drop=0,
-            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, text_delta_scale=text_delta_scale, temperature=temperature,
+            timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
 
         text_emb, gt_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
         text_emb_pred, pred_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
-
-        text_np_batch = text_emb_pred.cpu().numpy()
-        pred_np_batch = pred_emb.cpu().numpy()
-        r_precision_sum += calculate_R_precision(text_np_batch, pred_np_batch, top_k=3, sum_all=True)
-        matching_sum += euclidean_distance_matrix(text_np_batch, pred_np_batch).trace()
 
         text_emb_list.append(text_emb_pred)
         gt_emb_list.append(gt_emb)
@@ -183,11 +162,12 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         print("No generation samples were found in eval_loader.")
         return None
 
+    text_np = torch.cat(text_emb_list, dim=0).cpu().numpy()
     gt_np = torch.cat(gt_emb_list, dim=0).cpu().numpy()
     pred_np = torch.cat(pred_emb_list, dim=0).cpu().numpy()
 
-    r_precision = r_precision_sum / nb_sample
-    matching = matching_sum / nb_sample
+    r_precision = calculate_R_precision(text_np, pred_np, top_k=3, sum_all=True) / nb_sample
+    matching = euclidean_distance_matrix(text_np, pred_np).trace() / nb_sample
 
     gt_mu, gt_cov = calculate_activation_statistics(gt_np)
     mu, cov = calculate_activation_statistics(pred_np)
@@ -280,8 +260,7 @@ if __name__ == '__main__':
 
     vq_model, vq_cfg = load_vq_model(trans_cfg, device)
     ckpt_name = args.ckpt or eval_cfg.which_ckpt
-    stage_dir = getattr(eval_cfg, 'stage_dir', 'VA_motion')
-    trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, stage_dir=stage_dir)
+    trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device)
 
     dataset_opt_path = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'Comp_v6_KLD005', 'opt.txt')
     hml3d_opt = prepare_hml_opt(get_opt(dataset_opt_path, device), trans_cfg)
@@ -309,8 +288,7 @@ if __name__ == '__main__':
 
     log_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'eval')
     os.makedirs(log_dir, exist_ok=True)
-    safe_ckpt_name = ckpt_name.replace(".tar", "").replace("/", "_").replace("\\", "_")
-    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{safe_ckpt_name}.log'
+    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_name.replace(".tar", "")}.log'
     out_path = pjoin(log_dir, log_name)
     f = open(out_path, 'w', encoding='utf-8')
     print(f'Logging to {out_path}')
@@ -319,8 +297,6 @@ if __name__ == '__main__':
     gsample = getattr(eval_cfg, 'gsample', True)
     temp = getattr(eval_cfg, 'temperature', 1)
     source_cond_scale = getattr(eval_cfg, 'source_cond_scale', 1.0)
-    text_delta_scale = 1.0   # legacy model arg
-    source_hint_ratio = getattr(eval_cfg, 'source_hint_ratio', 0.0)
     base_seed = getattr(trans_cfg.exp, 'seed', 3407)
 
     for cs in eval_cfg.cond_scales:
@@ -329,7 +305,7 @@ if __name__ == '__main__':
 
             for i in range(eval_cfg.repeat_time):
                 fixseed(base_seed + i)
-                header = f'Guidance scale: {cs}, source_hint_ratio: {source_hint_ratio}, time step: {ts}, repeat: {i}'
+                header = f'Guidance scale: {cs}, time step: {ts}, repeat: {i}'
                 print(header)
                 print(header, file=f, flush=True)
 
@@ -337,7 +313,7 @@ if __name__ == '__main__':
                     gen_metrics = evaluation_generation_hml(
                         gen_loader, trans, vq_model, eval_wrapper, device,
                         time_steps=ts, cond_scale=cs, unit_length=trans_cfg.data.unit_length,
-                        source_cond_scale=source_cond_scale, text_delta_scale=text_delta_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample
+                        source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample
                     )
                     if gen_metrics is not None:
                         gen_metrics_list.append(gen_metrics)
@@ -348,16 +324,14 @@ if __name__ == '__main__':
                     edit_metrics = evaluation_motion_editing_hml(
                         edit_loader, trans, vq_model, writer=None, ep=i, eval_wrapper=edit_eval_wrapper, device=device,
                         time_steps=ts, cond_scale=cs, unit_length=trans_cfg.data.unit_length,
-                        source_cond_scale=source_cond_scale, text_delta_scale=text_delta_scale,
-                        source_hint_ratio=source_hint_ratio,
-                        temperature=temp, topk_filter_thres=topkr, gsample=gsample, draw=False
+                        source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample, draw=False
                     )
                     if edit_metrics is not None:
                         edit_metrics_list.append(edit_metrics)
                         print(format_editing(edit_metrics))
                         print(format_editing(edit_metrics), file=f, flush=True)
 
-            summary_head = f'=== Final Result  cs={cs}  source_scale={source_cond_scale}  source_hint_ratio={source_hint_ratio}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
+            summary_head = f'=== Final Result  cs={cs}  source_scale={source_cond_scale}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
             print(summary_head)
             print(summary_head, file=f, flush=True)
 
