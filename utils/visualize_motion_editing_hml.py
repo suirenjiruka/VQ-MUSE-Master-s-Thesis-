@@ -120,9 +120,6 @@ def load_trans_model(cfg, vq_cfg, ckpt_name, device):
 
     trans = VAMotion(cfg=cfg, device=device, full_length=cfg.data.max_motion_length // cfg.data.unit_length)
     missing, unexpected = trans.load_state_dict(ckpt["training_model"], strict=False)
-    if any(k.startswith(("delta_encoder.", "delta_head.", "delta_code_proj.", "delta_control_proj.")) for k in missing):
-        trans.use_vq_delta = False
-        print("VQ delta disabled for old checkpoint without delta weights.")
     old_prefixes = (
         "text_delta_encoder.",
         "condition_encoder.",
@@ -132,6 +129,9 @@ def load_trans_model(cfg, vq_cfg, ckpt_name, device):
         "part_text_mlp.",
         "part_source_mlp.",
         "edit_loc_head.",
+        "task_embed.",
+        "text_delta_scale",
+        "source_delta_scale",
     )
     old_keys = {"part_joint_mask"}
     ignored_unexpected = [k for k in unexpected if k in old_keys or k.startswith(old_prefixes)]
@@ -864,8 +864,6 @@ def main():
     vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
     vq_model = load_vq_model(cfg, vq_cfg, device)
     trans = load_trans_model(cfg, vq_cfg, vis_cfg.ckpt, device)
-    if hasattr(trans, "set_vq_codebook"):
-        trans.set_vq_codebook(vq_model.quantizer.codebook)
     dataset = build_dataset(cfg, mean, std, vis_cfg.split, int(vis_cfg.motionfix_start_id))
 
     mesh_mode = getattr(vis_cfg, "mesh_mode", "smpl")

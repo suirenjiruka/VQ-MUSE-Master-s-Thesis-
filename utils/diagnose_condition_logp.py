@@ -36,12 +36,9 @@ def load_trans(cfg, vq_cfg, ckpt_path, device):
 
     trans = VAMotion(cfg=cfg, device=device, full_length=cfg.data.max_motion_length // cfg.data.unit_length)
     missing, unexpected = trans.load_state_dict(state, strict=False)
-    if any(k.startswith(("delta_encoder.", "delta_head.", "delta_code_proj.", "delta_control_proj.")) for k in missing):
-        trans.use_vq_delta = False
-        print("VQ delta disabled for old checkpoint without delta weights.")
     old_prefix = ("text_delta_encoder.", "condition_encoder.", "edit_map_head.",
                   "part_gate_mlp.", "part_cond_mlp.", "part_text_mlp.", "part_source_mlp.",
-                  "edit_loc_head.")
+                  "edit_loc_head.", "task_embed.", "text_delta_scale", "source_delta_scale")
     unexpected = [k for k in unexpected if not k.startswith(old_prefix)]
     print(f"loaded: {ckpt_path}")
     print(f"epoch: {ckpt.get('epoch', '?')}")
@@ -70,8 +67,7 @@ def single_branch_logits(trans, motion_ids, source_ids, text_tokens, toa_pe, sou
         input_text_embs = trans.null_text_embed.expand_as(text_tokens)
     logits, _, _ = trans.run_condition_branch(
         motion_ids, source_ids, input_text_embs, toa_pe, source_pe,
-        source_mask, text_mask, padding_mask, has_source,
-        delta_active=has_source.view(-1, 1, 1).bool() if use_text else torch.zeros_like(has_source.view(-1, 1, 1)).bool()
+        source_mask, text_mask, padding_mask, has_source
     )
     return logits
 
@@ -170,8 +166,6 @@ def main():
     vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
     vq_model = load_vq_model(cfg, vq_cfg, device)
     trans = load_trans(cfg, vq_cfg, ckpt_path, device)
-    if hasattr(trans, "set_vq_codebook"):
-        trans.set_vq_codebook(vq_model.quantizer.codebook)
     dataset = build_dataset(cfg, mean, std, args.split, args.motionfix_start_id)
     indices = select_indices(dataset, "edit", 0, args.num_samples, random_select=True, seed=args.seed)
     random.shuffle(indices)

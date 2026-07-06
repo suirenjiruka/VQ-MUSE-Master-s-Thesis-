@@ -47,8 +47,6 @@ class VA_motion_trainer:
         self.edit_eval_wrapper = edit_eval_wrapper if edit_eval_wrapper is not None else eval_wrapper
         #self.eval_wrapper.eval()
         self.device = device
-        if hasattr(self.training_model, "set_vq_codebook"):
-            self.training_model.set_vq_codebook(self.vq_model.quantizer.codebook)
         lr = float(cfg.training.lr)
         weight_decay = float(cfg.training.weight_decay)
         param_groups = [p for p in self.training_model.parameters() if p.requires_grad]
@@ -77,12 +75,12 @@ class VA_motion_trainer:
         #ensure all input device consistant
         caption = caption.to(self.device).float() if torch.is_tensor(caption) else caption
 
-        _loss, loss_mt, delta_loss, latent_loss, _acc = self.training_model(
+        _loss, loss_mt, _acc = self.training_model(
             target_code_idx, source_code_idx, caption, m_lens, has_source,
             source_m_lens=src_m_lens, source_joints=src_joints, target_joints=tgt_joints
         )
 
-        return _loss, loss_mt, delta_loss, latent_loss, _acc
+        return _loss, loss_mt, _acc
     
     def save(self, save_pth, epoch: int):
         # save model
@@ -105,8 +103,6 @@ class VA_motion_trainer:
     def train(self, train_loader, val_loader, eval_loader, gen_eval_loader=None):
         self.training_model.to(self.device)
         self.vq_model.to(self.device)
-        if hasattr(self.training_model, "set_vq_codebook"):
-            self.training_model.set_vq_codebook(self.vq_model.quantizer.codebook)
 
         max_epoch = self.config.training.max_epoch
         epoch = 0
@@ -123,7 +119,7 @@ class VA_motion_trainer:
             _, unexpected_keys = self.training_model.load_state_dict(checkpoint['training_model'], strict=False)
             old_keys = ("text_delta_encoder.", "condition_encoder.", "edit_map_head.",
                         "part_gate_mlp.", "part_cond_mlp.", "part_text_mlp.", "part_source_mlp.",
-                        "edit_loc_head.")
+                        "edit_loc_head.", "task_embed.", "text_delta_scale", "source_delta_scale")
             unexpected_keys = [k for k in unexpected_keys if not k.startswith(old_keys)]
             assert len(unexpected_keys) == 0
             try:
@@ -149,12 +145,9 @@ class VA_motion_trainer:
         # loss weight setup
         w_trans = self.config.loss.weight_transformer_loss
         w_mtext  = self.config.loss.weight_motion_text_InfoNCE
-        w_delta = getattr(self.config.loss, "weight_delta", 0.0)
-        w_latent = getattr(self.config.loss, "weight_latent", 0.0)
 
         # tensorboard log format initialiozation
-        logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
-                "delta": 0.0, "latent": 0.0, "accuracy": 0.0}
+        logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0, "accuracy": 0.0}
         log_period = self.config.training.log_every
 
         # init training parameter
@@ -171,8 +164,8 @@ class VA_motion_trainer:
             for i, batch in tqdm(enumerate(train_loader)):
                 current_iter += 1
                 # calculatte loss & optimization
-                transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, acc = self.forward(batch)
-                loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss + w_delta * delta_loss + w_latent * latent_loss
+                transformer_loss, InfoNCE_mt_loss, acc = self.forward(batch)
+                loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
                 self.optimizer.zero_grad()
                 if math.isnan(loss.item()):
                     continue # loss = nan, skip
@@ -184,8 +177,6 @@ class VA_motion_trainer:
                 logs['total_loss'] += loss.item()
                 logs['transformer_loss'] += transformer_loss.item()
                 logs['InfoNCE_text'] += InfoNCE_mt_loss.item()
-                logs['delta'] += delta_loss.item()
-                logs['latent'] += latent_loss.item()
                 logs['accuracy'] += acc
 
                 #print log every n steps 
@@ -193,10 +184,9 @@ class VA_motion_trainer:
                     for key, value in logs.items():
                         self.logger.add_scalar(f"train/{key}", value / log_period, current_iter)
                     # print logs
-                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, delta: {logs['delta'] / log_period:.4f}, latent: {logs['latent'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
+                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
                     # reset logs
-                    logs =  {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
-                              "delta": 0.0, "latent": 0.0, "accuracy": 0.0}
+                    logs =  {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0, "accuracy": 0.0}
                     
                     
             #save checkpoints
@@ -213,8 +203,8 @@ class VA_motion_trainer:
 
             with torch.no_grad():
                 for i, batch in enumerate(val_loader):
-                    transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, acc = self.forward(batch)
-                    loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss + w_delta * delta_loss + w_latent * latent_loss
+                    transformer_loss, InfoNCE_mt_loss, acc = self.forward(batch)
+                    loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
                     val_loss += loss.item()
                     val_acc += acc
                     # round to 3 decimals
@@ -238,7 +228,7 @@ class VA_motion_trainer:
                 eval_metrics = evaluation_motion_editing_hml(
                     eval_loader, self.training_model, self.vq_model, self.logger, epoch,
                     eval_wrapper=self.edit_eval_wrapper, device=self.device,
-                    # text-only CFG: source stays fixed, cond_scale boosts text direction
+                    # dual CFG: source branch + text edit branch
                     time_steps=10, cond_scale=getattr(self.config.inference, "edit_cond_scale", 2),
                     source_cond_scale=getattr(self.config.inference, "source_cond_scale", 1.0),
                     text_delta_scale=getattr(self.config.inference, "text_delta_scale", 1.0), unit_length=self.config.data.unit_length,

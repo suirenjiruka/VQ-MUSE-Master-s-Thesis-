@@ -68,12 +68,9 @@ def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, stage_dir='VA_motion'
 
     state = {k: v for k, v in state.items() if not k.startswith('text_emb.')}
     missing, unexpected = trans.load_state_dict(state, strict=False)
-    if any(k.startswith(("delta_encoder.", "delta_head.", "delta_code_proj.", "delta_control_proj.")) for k in missing):
-        trans.use_vq_delta = False
-        print("VQ delta disabled for old checkpoint without delta weights.")
     old_keys = ('text_delta_encoder.', 'condition_encoder.', 'edit_map_head.',
                 'part_gate_mlp.', 'part_cond_mlp.', 'part_text_mlp.', 'part_source_mlp.',
-                'edit_loc_head.')
+                'edit_loc_head.', 'task_embed.', 'text_delta_scale', 'source_delta_scale')
     unexpected = [k for k in unexpected if not k.startswith(old_keys)]
     if missing:
         print(f'missing keys from ckpt: {missing[:5]}')
@@ -150,6 +147,8 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
     vq_model.eval()
 
     text_emb_list, gt_emb_list, pred_emb_list = [], [], []
+    r_precision_sum = np.zeros(3)
+    matching_sum = 0.0
     nb_sample = 0
 
     for batch in tqdm(eval_loader):
@@ -170,6 +169,11 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         text_emb, gt_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
         text_emb_pred, pred_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
 
+        text_np_batch = text_emb_pred.cpu().numpy()
+        pred_np_batch = pred_emb.cpu().numpy()
+        r_precision_sum += calculate_R_precision(text_np_batch, pred_np_batch, top_k=3, sum_all=True)
+        matching_sum += euclidean_distance_matrix(text_np_batch, pred_np_batch).trace()
+
         text_emb_list.append(text_emb_pred)
         gt_emb_list.append(gt_emb)
         pred_emb_list.append(pred_emb)
@@ -179,12 +183,11 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         print("No generation samples were found in eval_loader.")
         return None
 
-    text_np = torch.cat(text_emb_list, dim=0).cpu().numpy()
     gt_np = torch.cat(gt_emb_list, dim=0).cpu().numpy()
     pred_np = torch.cat(pred_emb_list, dim=0).cpu().numpy()
 
-    r_precision = calculate_R_precision(text_np, pred_np, top_k=3, sum_all=True) / nb_sample
-    matching = euclidean_distance_matrix(text_np, pred_np).trace() / nb_sample
+    r_precision = r_precision_sum / nb_sample
+    matching = matching_sum / nb_sample
 
     gt_mu, gt_cov = calculate_activation_statistics(gt_np)
     mu, cov = calculate_activation_statistics(pred_np)
@@ -278,10 +281,7 @@ if __name__ == '__main__':
     vq_model, vq_cfg = load_vq_model(trans_cfg, device)
     ckpt_name = args.ckpt or eval_cfg.which_ckpt
     stage_dir = getattr(eval_cfg, 'stage_dir', 'VA_motion')
-    trans_cfg.model.use_text_delta = False
     trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, stage_dir=stage_dir)
-    if hasattr(trans, "set_vq_codebook"):
-        trans.set_vq_codebook(vq_model.quantizer.codebook)
 
     dataset_opt_path = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'Comp_v6_KLD005', 'opt.txt')
     hml3d_opt = prepare_hml_opt(get_opt(dataset_opt_path, device), trans_cfg)

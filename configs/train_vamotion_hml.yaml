@@ -67,16 +67,9 @@ model:
   dropout: 0.1
   fuse_mode: 'cross_attention'
   use_abs_pe: True
-  use_toa_pe: False
+  use_toa_pe: True
   use_lvl_pe: False
   use_task_token: False
-  use_cond_delta: False
-  text_delta_init: 1.0
-  source_delta_init: 1.0
-  use_vq_delta: True
-  delta_alpha: 0.2   # latent logits scale
-  delta_beta: 0.5    # layer-wise delta residual scale
-  delta_temp: 0.1
   # fuse_mode: 'in_context'
 
 
@@ -97,17 +90,14 @@ training:
   ema_decay: 0.999
   # CFG / corruption
   m_drop: 0.1  # target full mask
-  v_drop: 0.0  # legacy, no source CFG drop
+  v_drop: 0.1  # source CFG drop
   t_drop: 0.1  # text CFG drop
   s_drop: 0.0  # source token drop
-  src_fill_prob: 0.1  # source inpainting corruption: fraction of masked slots that show the aligned source token
+  src_fill_prob: 0.0  # no train-time source fill in 9am recovery
 
 loss:
   weight_transformer_loss: 1.0
   weight_motion_text_InfoNCE: 0.2
-  weight_delta: 0.1
-  weight_latent: 0.05
-  #weight_edit_map: 0.5
 
 inference:
   ext: 'pool_32'

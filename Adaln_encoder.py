@@ -101,15 +101,12 @@ class AdaLN_Encoder(nn.Module):
         nn.init.normal_(self.final_adaln_proj[-1].weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.final_adaln_proj[-1].bias)
 
-    def forward(self, x, cond, padding_mask=None, control_residuals=None, control_gate=None,
-                delta_residuals=None, delta_gate=None):
+    def forward(self, x, cond, padding_mask=None, control_residuals=None, control_gate=None):
         """
         x: [B, L, model_dim] -> 純動作特徵 (masked_motion_tokens)
         cond: [B, L, cond_dim] -> 融合後的 Text+Video 條件特徵 (cond_fused)
         control_residuals: per-layer residuals from AdaLN_ControlBranch (ControlNet-style injection)
         control_gate: [B, 1, 1], 1 for edit samples, 0 keeps gen samples structurally untouched
-        delta_residuals: per-layer residuals from VQ delta branch
-        delta_gate: [B, 1, 1], 1 for edit samples, 0 keeps gen samples untouched
         """
         for i, layer in enumerate(self.layers):
             x = layer(x, cond, padding_mask)
@@ -117,11 +114,6 @@ class AdaLN_Encoder(nn.Module):
                 r = control_residuals[i]
                 if control_gate is not None:
                     r = r * control_gate
-                x = x + r
-            if delta_residuals is not None:
-                r = delta_residuals[i]
-                if delta_gate is not None:
-                    r = r * delta_gate
                 x = x + r
             
         # final normalize - without feed forward

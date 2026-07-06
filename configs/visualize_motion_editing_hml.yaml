@@ -2,7 +2,7 @@ trans_cfg: './configs/train_vamotion_hml.yaml'
 visual_cfg: './utils/visual_config.yaml'
 
 # Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
-ckpt: 'test/best.tar'
+ckpt: 'best.tar'
 
 # Data selection
 split: 'test'
@@ -31,6 +31,7 @@ frame_stride: 1
 max_frames: 60
 use_proxy_mesh: True
 mesh_mode: 'smpl_fit'  # smpl_fit = SMPLify from recovered joints; smpl = fast HML-rot mesh; joint = capsule/sphere debug; none = skeleton only
+skeleton_only: False
 mesh_align_to_joints: True
 mesh_alignment_scale: True
 smpl_fit_input_scale: 1.0
@@ -40,35 +41,39 @@ smpl_fit_full_frame_align: True
 mesh_warp_to_skeleton: False
 skeleton_overlay_source: 'mesh'  # mesh = fitted SMPL joints; target = recovered HML skeleton
 skeleton_overlay_mode: 'screen'  # screen = draw skeleton over final frame so mesh cannot hide it; 3d | both are also supported
+skeleton_match_mesh_color: True
 show_body_features: True
 align_visual_lengths: True
 use_skeleton_overlay: True
 allow_skeleton_fallback: False
 
 # Appearance
-bg_color: [0.96, 0.97, 0.98, 1.0]
-ambient_light: [0.34, 0.34, 0.34]
-left_color: [0.18, 0.36, 0.95, 1.0]
-target_color: [0.12, 0.62, 0.34, 1.0]
-right_color: [0.95, 0.28, 0.12, 1.0]
+bg_color: [0.97, 0.98, 0.99, 1.0]
+ambient_light: [0.56, 0.56, 0.56]
+left_color: [0.32, 0.50, 1.00, 1.0]
+target_color: [0.24, 0.72, 0.43, 1.0]
+right_color: [1.00, 0.44, 0.24, 1.0]
 mesh_alpha: 1.0
 mesh_wireframe: True
-mesh_wireframe_color: [0.01, 0.01, 0.015, 0.20]
+mesh_wireframe_color: [0.03, 0.03, 0.035, 0.12]
 mesh_wireframe_scale: 1.001
 mesh_screen_outline: True
 mesh_outline_color: [0.01, 0.01, 0.015, 1.0]
-mesh_outline_alpha: 0.72
-mesh_outline_width: 2
-skeleton_color: [0.02, 0.025, 0.03, 0.90]
-joint_color: [0.00, 0.00, 0.00, 0.95]
-skeleton_screen_alpha: 0.88
-skeleton_screen_bone_width: 2
-skeleton_screen_joint_radius: 3
+mesh_outline_alpha: 0.88
+mesh_outline_width: 3
+skeleton_color: [0.20, 0.21, 0.23, 0.62]
+joint_color: [0.12, 0.12, 0.13, 0.70]
+skeleton_screen_alpha: 0.58
+skeleton_screen_bone_width: 1
+skeleton_screen_joint_radius: 2
+skeleton_screen_joint_halo: False
 face_feature_color: [0.02, 0.02, 0.02, 1.0]
 face_line_radius: 0.006
 floor_color: [0.86, 0.89, 0.94, 1.0]
 bone_radius: 0.006
 joint_radius: 0.010
+caption_bottom_margin: 118
+caption_bar_height: 34
 view_spacing: 1.65
 mesh_limb_radius: 0.055
 mesh_torso_radius: 0.085

@@ -126,9 +126,7 @@ if __name__ == '__main__':
         os.makedirs(cfg.exp.checkpoint_dir, exist_ok=True)
         shutil.copy(args.config, cfg.exp.checkpoint_dir)
 
-    cfg.model.use_text_delta = False
-    print(f"loss weights: CE={cfg.loss.weight_transformer_loss}, InfoNCE={cfg.loss.weight_motion_text_InfoNCE}, "
-          f"delta={getattr(cfg.loss, 'weight_delta', 0.0)}, latent={getattr(cfg.loss, 'weight_latent', 0.0)}")
+    print(f"loss weights: CE={cfg.loss.weight_transformer_loss}, InfoNCE={cfg.loss.weight_motion_text_InfoNCE}")
 
     fixseed(cfg.exp.seed)
 
