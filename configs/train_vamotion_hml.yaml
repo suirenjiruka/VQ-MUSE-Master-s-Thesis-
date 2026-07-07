@@ -70,15 +70,19 @@ model:
   use_toa_pe: True
   use_lvl_pe: False
   use_vq_delta: True
-  delta_alpha: 0.2
+  use_latent_classifier: True
+  delta_alpha: 0.0
   delta_beta: 0.3
   delta_temp: 0.15
+  latent_w_min: 0.65
+  latent_w_max: 1.0
+  raw_w_sum: 1.3
   # fuse_mode: 'in_context'
 
 
 training:
   batch_size: 64
-  max_epoch: 500
+  max_epoch: 250
   cond_drop_prob: 0.1
   weight_decay: 0.0
   pert_prob: 0.1
@@ -101,8 +105,8 @@ loss:
   weight_transformer_loss: 1.0
   weight_motion_text_InfoNCE: 0.2
   weight_delta: 0.5
-  weight_latent: 0.05
-  weight_rank: 0.05
+  weight_latent: 0.1
+  weight_rank: 0.03
   delta_rank_margin: 0.2
 
 inference:

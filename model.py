@@ -200,6 +200,10 @@ class VAMotion(nn.Module):
         self.delta_alpha = float(getattr(cfg.model, "delta_alpha", 0.0))
         self.delta_beta = float(getattr(cfg.model, "delta_beta", 0.3))
         self.delta_temp = float(getattr(cfg.model, "delta_temp", 0.15))
+        self.use_latent_classifier = getattr(cfg.model, "use_latent_classifier", False)
+        self.latent_w_min = float(getattr(cfg.model, "latent_w_min", 0.5))
+        self.latent_w_max = float(getattr(cfg.model, "latent_w_max", 0.9))
+        self.raw_w_sum = float(getattr(cfg.model, "raw_w_sum", 1.4))
         self.delta_code_proj = nn.Linear(self.motion_dim, self.latent_dim)
         self.delta_control_proj = nn.Linear(self.latent_dim * 4, self.latent_dim)
         self.delta_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
@@ -360,7 +364,7 @@ class VAMotion(nn.Module):
     def run_delta_branch(self, transformer_input, text_cross, source_cross, aligned_src_ids,
                          target_mask, padding_mask, delta_active):
         # extra edit path, silent for gen/null-text samples
-        if (not self.use_vq_delta) or self.delta_alpha == 0.0 and self.delta_beta == 0.0:
+        if (not self.use_vq_delta) or (self.delta_alpha == 0.0 and self.delta_beta == 0.0 and not self.use_latent_classifier):
             return None, None, None, None
 
         active = delta_active.view(-1, 1, 1).bool()
@@ -388,6 +392,27 @@ class VAMotion(nn.Module):
         if latent_res_logits is None or self.delta_alpha == 0.0:
             return token_logits
         return token_logits + self.delta_alpha * latent_res_logits
+
+    def latent_classifier_logits(self, raw_logits, latent_logits, active_edit, mask_ratio):
+        # edit uses latent classifier as main path; gen keeps raw logits
+        if (not self.use_latent_classifier) or latent_logits is None:
+            return raw_logits
+
+        t = mask_ratio.to(raw_logits.device, dtype=raw_logits.dtype).view(-1)
+        if t.numel() == 1:
+            t = t.expand(raw_logits.shape[0])
+        elif t.numel() != raw_logits.shape[0]:
+            repeat = raw_logits.shape[0] // t.numel()
+            if repeat * t.numel() != raw_logits.shape[0]:
+                t = t.mean().expand(raw_logits.shape[0])
+            else:
+                t = t.repeat(repeat)
+        t = t.clamp(0.0, 1.0).view(-1, 1, 1)
+
+        latent_w = self.latent_w_min + (self.latent_w_max - self.latent_w_min) * t
+        raw_w = self.raw_w_sum - latent_w
+        mixed_logits = latent_w * latent_logits + raw_w * raw_logits
+        return torch.where(active_edit.bool(), mixed_logits, raw_logits)
 
     def vq_delta_losses(self, latent_logits, delta_pred, target_ids, source_ids,
                         target_mask, predict_mask, active_edit):
@@ -567,7 +592,10 @@ class VAMotion(nn.Module):
             delta_gate=active_edit.float() * self.delta_beta
         )
         raw_logits = self.output_process(output)
-        logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
+        if self.use_latent_classifier:
+            logits = self.latent_classifier_logits(raw_logits, latent_logits, active_edit, rand_mask_probs)
+        else:
+            logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
 
         # masked token CE
         ce_loss, _, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
@@ -640,7 +668,7 @@ class VAMotion(nn.Module):
         # source branch: branch A gate 0, branch B/C use aligned source
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=input_motion_padding_mask)
         active_edit = input_has_source & input_has_text
-        delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
+        delta_residuals, latent_res_logits, latent_logits, _ = self.run_delta_branch(
             transformer_input, text_cross, source_cross, aligned_src_ids,
             non_pad, input_motion_padding_mask, active_edit
         )
@@ -655,8 +683,11 @@ class VAMotion(nn.Module):
             delta_residuals=delta_residuals,
             delta_gate=active_edit.float() * self.delta_beta
         )
-        output_logits = self.output_process(output) # [B, L, dim] -> [B, dim, L]
-        output_logits = self.apply_vq_delta_logits(output_logits, latent_res_logits)
+        raw_logits = self.output_process(output) # [B, L, dim] -> [B, dim, L]
+        if self.use_latent_classifier:
+            output_logits = raw_logits
+        else:
+            output_logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
         uncond_logits, source_logits, full_logits = output_logits.chunk(3, dim=0)
 
         if torch.is_tensor(cond_scale):
@@ -666,6 +697,9 @@ class VAMotion(nn.Module):
 
         # source_scale controls preservation strength, cond_scale controls edit-text strength
         scaled_logits = uncond_logits + source_scale * (source_logits - uncond_logits) + cond_scale * (full_logits - source_logits)
+        if self.use_latent_classifier and latent_logits is not None:
+            _, _, latent_full_logits = latent_logits.chunk(3, dim=0)
+            scaled_logits = self.latent_classifier_logits(scaled_logits, latent_full_logits, task_is_edit, mask_ratio)
         return scaled_logits #[B, dim, L]
 
     @torch.no_grad()
