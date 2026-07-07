@@ -536,6 +536,12 @@ def get_mesh_colors(vis_cfg, num_views):
     return [tuple(vis_cfg.left_color), tuple(vis_cfg.right_color)]
 
 
+def get_skeleton_colors(vis_cfg, num_views):
+    if bool(getattr(vis_cfg, "skeleton_match_mesh_color", True)):
+        return get_mesh_colors(vis_cfg, num_views)
+    return [tuple(getattr(vis_cfg, "skeleton_color", [0.0, 0.0, 0.0, 1.0])) for _ in range(num_views)]
+
+
 def project_points_to_screen(points, camera_pose, yfov, width, height):
     points_h = np.concatenate([points, np.ones((points.shape[0], 1), dtype=points.dtype)], axis=1)
     camera_points = (np.linalg.inv(camera_pose) @ points_h.T).T[:, :3]
@@ -555,7 +561,7 @@ def _rgb255(color):
     return tuple(int(np.clip(channel, 0.0, 1.0) * 255) for channel in color[:3])
 
 
-def add_screen_skeleton_overlay(frame, joints_per_view, camera_pose, yfov, kinematic_chain, vis_cfg):
+def add_screen_skeleton_overlay(frame, joints_per_view, camera_pose, yfov, kinematic_chain, vis_cfg, view_colors=None):
     try:
         import cv2
     except Exception:
@@ -567,13 +573,18 @@ def add_screen_skeleton_overlay(frame, joints_per_view, camera_pose, yfov, kinem
     for chain in kinematic_chain:
         edges += list(zip(chain[:-1], chain[1:]))
 
-    bone_color = _rgb255(getattr(vis_cfg, "skeleton_color", [0.0, 0.0, 0.0, 1.0]))
-    joint_color = _rgb255(getattr(vis_cfg, "joint_color", [0.0, 0.0, 0.0, 1.0]))
     alpha = float(getattr(vis_cfg, "skeleton_screen_alpha", 0.88))
     bone_width = max(1, int(getattr(vis_cfg, "skeleton_screen_bone_width", 2)))
     joint_radius = max(1, int(getattr(vis_cfg, "skeleton_screen_joint_radius", 3)))
+    joint_halo = bool(getattr(vis_cfg, "skeleton_screen_joint_halo", True))
 
-    for joints in joints_per_view:
+    for view_id, joints in enumerate(joints_per_view):
+        if view_colors is not None and view_id < len(view_colors):
+            bone_color = _rgb255(view_colors[view_id])
+            joint_color = bone_color
+        else:
+            bone_color = _rgb255(getattr(vis_cfg, "skeleton_color", [0.0, 0.0, 0.0, 1.0]))
+            joint_color = _rgb255(getattr(vis_cfg, "joint_color", [0.0, 0.0, 0.0, 1.0]))
         screen, valid = project_points_to_screen(joints, camera_pose, yfov, width, height)
         for a, b in edges:
             if a >= len(joints) or b >= len(joints) or not (valid[a] and valid[b]):
@@ -585,7 +596,8 @@ def add_screen_skeleton_overlay(frame, joints_per_view, camera_pose, yfov, kinem
             if not is_valid:
                 continue
             center = tuple(np.round(point).astype(np.int32))
-            cv2.circle(overlay, center, joint_radius + 1, (255, 255, 255), -1, cv2.LINE_AA)
+            if joint_halo:
+                cv2.circle(overlay, center, joint_radius + 1, (255, 255, 255), -1, cv2.LINE_AA)
             cv2.circle(overlay, center, joint_radius, joint_color, -1, cv2.LINE_AA)
 
     return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0)
@@ -624,6 +636,7 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
     stride = max(1, int(vis_cfg.frame_stride))
     num_views = len(joints_list)
     colors = get_mesh_colors(vis_cfg, num_views)
+    skeleton_colors = get_skeleton_colors(vis_cfg, num_views)
     mesh_mode = getattr(vis_cfg, "mesh_mode", "smpl")
     overlay_source = getattr(vis_cfg, "skeleton_overlay_source", "target")
     skeleton_chain = SMPL_KINEMATIC_CHAIN if mesh_mode == "smpl_fit" and overlay_source == "mesh" else HML_KINEMATIC_CHAIN
@@ -664,7 +677,9 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
                 if bool(getattr(vis_cfg, "show_body_features", False)):
                     add_body_features(scene, trimesh, pyrender, cur_joints, vis_cfg)
             if draw_3d_skeleton:
-                add_skeleton(scene, trimesh, pyrender, cur_joints, tuple(vis_cfg.skeleton_color), tuple(vis_cfg.joint_color),
+                bone_color = skeleton_colors[idx] if idx < len(skeleton_colors) else tuple(vis_cfg.skeleton_color)
+                joint_color = bone_color if bool(getattr(vis_cfg, "skeleton_match_mesh_color", True)) else tuple(vis_cfg.joint_color)
+                add_skeleton(scene, trimesh, pyrender, cur_joints, bone_color, joint_color,
                              float(vis_cfg.bone_radius), float(vis_cfg.joint_radius), kinematic_chain=skeleton_chain)
 
         all_pts = np.concatenate(frame_joints, axis=0)
@@ -694,15 +709,18 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
         if draw_mesh_outline and len(frame_vertices) > 0:
             color = add_screen_mesh_outline(color, frame_vertices, cam_pose, camera_yfov, vis_cfg)
         if draw_screen_skeleton:
-            color = add_screen_skeleton_overlay(color, frame_joints, cam_pose, camera_yfov, skeleton_chain, vis_cfg)
-        color = add_labels(color, caption, labels, frame_id, frames)
+            color = add_screen_skeleton_overlay(
+                color, frame_joints, cam_pose, camera_yfov, skeleton_chain, vis_cfg,
+                view_colors=skeleton_colors,
+            )
+        color = add_labels(color, caption, labels, frame_id, frames, vis_cfg)
         video.append(color)
 
     renderer.delete()
     return save_video(out_path, video, int(vis_cfg.fps))
 
 
-def add_labels(frame, caption, labels, frame_id, total_frames):
+def add_labels(frame, caption, labels, frame_id, total_frames, vis_cfg=None):
     try:
         import cv2
     except Exception:
@@ -718,8 +736,14 @@ def add_labels(frame, caption, labels, frame_id, total_frames):
     cv2.putText(frame, f"{frame_id + 1}/{total_frames}", (w - 120, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1, cv2.LINE_AA)
     if caption:
         text = caption[:130]
-        cv2.rectangle(frame, (18, h - 74), (w - 18, h - 45), (255, 255, 255), -1)
-        cv2.putText(frame, text, (26, h - 52), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (20, 20, 20), 1, cv2.LINE_AA)
+        bottom_margin = int(getattr(vis_cfg, "caption_bottom_margin", 160)) if vis_cfg is not None else 160
+        bar_height = int(getattr(vis_cfg, "caption_bar_height", 44)) if vis_cfg is not None else 44
+        font_scale = float(getattr(vis_cfg, "caption_font_scale", 0.68)) if vis_cfg is not None else 0.68
+        thickness = max(1, int(getattr(vis_cfg, "caption_thickness", 2))) if vis_cfg is not None else 2
+        bar_bottom = max(58, h - bottom_margin)
+        bar_top = max(44, bar_bottom - bar_height)
+        cv2.rectangle(frame, (18, bar_top), (w - 18, bar_bottom), (255, 255, 255), -1)
+        cv2.putText(frame, text, (28, bar_bottom - 13), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (20, 20, 20), thickness, cv2.LINE_AA)
     return frame
 
 
@@ -742,15 +766,28 @@ def generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device
         pair_name = "gt_vs_gen"
         labels = ("GT Target", "Generated Output")
 
-    mids = trans.generate(
-        source_code_idx, [caption], m_length_t // cfg.data.unit_length, has_source_t, t_drop=0,
-        timesteps=int(vis_cfg.time_steps), cond_scale=float(vis_cfg.cond_scale),
+    generate_kwargs = dict(
+        timesteps=int(vis_cfg.time_steps),
+        cond_scale=float(vis_cfg.cond_scale),
         source_cond_scale=float(getattr(vis_cfg, "source_cond_scale", 1.0)),
         source_m_lens=src_m_length_t // cfg.data.unit_length if has_source else None,
-        source_hint_ratio=float(getattr(vis_cfg, "source_hint_ratio", getattr(cfg.inference, "source_hint_ratio", 0.0))),
-        temperature=float(vis_cfg.temperature), topk_filter_thres=float(vis_cfg.topkr),
-        gsample=bool(vis_cfg.gsample)
+        temperature=float(vis_cfg.temperature),
+        topk_filter_thres=float(vis_cfg.topkr),
+        gsample=bool(vis_cfg.gsample),
     )
+    try:
+        mids = trans.generate(
+            source_code_idx, [caption], m_length_t // cfg.data.unit_length, has_source_t, t_drop=0,
+            source_hint_ratio=float(getattr(vis_cfg, "source_hint_ratio", getattr(cfg.inference, "source_hint_ratio", 0.0))),
+            **generate_kwargs,
+        )
+    except TypeError as e:
+        if "source_hint_ratio" not in str(e):
+            raise
+        mids = trans.generate(
+            source_code_idx, [caption], m_length_t // cfg.data.unit_length, has_source_t, t_drop=0,
+            **generate_kwargs,
+        )
     pred_motion = vq_model.forward_decoder(mids, m_length_t.clone())[0].detach().cpu().numpy()
     if has_source:
         motions = [src_motion, tgt_motion, pred_motion]
@@ -823,7 +860,8 @@ def visualize_sample(result, cfg, vis_cfg, visual_cfg, mean, std, smpl_model, fa
         joints_list = [resample_sequence(joints, reference_frames) for joints in joints_list]
 
     safe_name = str(name).replace("/", "_").replace("\\", "_")
-    out_name = f"{safe_name}_{task_type}_{pair_name}.mp4"
+    suffix = "_skeleton" if bool(getattr(vis_cfg, "skeleton_only", False)) else ""
+    out_name = f"{safe_name}_{task_type}_{pair_name}{suffix}.mp4"
     out_path = pjoin(vis_cfg.output_dir, out_name)
     saved_path = render_motion_video(vertices_list, joints_list, faces, caption, labels, out_path, vis_cfg, visual_cfg,
                                      use_proxy_mesh=use_proxy_mesh)
@@ -834,17 +872,46 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='./configs/visualize_motion_editing_hml.yaml')
     parser.add_argument('--mode', type=str, default=None, choices=['all', 'gen', 'edit'])
+    parser.add_argument('--skeleton-only', '--skel', action='store_true',
+                        help='Fast path: skip SMPL fitting and render color-matched skeleton only.')
+    parser.add_argument('--random-select', action='store_true',
+                        help='Select samples randomly instead of using start_index.')
+    parser.add_argument('--random-seed', action='store_true',
+                        help='Use a fresh random seed for sample selection and generation.')
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Override the visualization seed.')
     args = parser.parse_args()
 
     vis_cfg = load_config(args.config)
     # quick task switch, data split uses motionfix_start_id
     if args.mode is not None:
         vis_cfg.mode = args.mode
+    if args.random_select:
+        vis_cfg.random_select = True
+    if args.seed is not None:
+        vis_cfg.seed = int(args.seed)
+    if args.random_seed:
+        vis_cfg.random_select = True
+        vis_cfg.seed = int.from_bytes(os.urandom(4), byteorder="little", signed=False)
+    if args.skeleton_only:
+        vis_cfg.skeleton_only = True
+        vis_cfg.mesh_mode = "none"
+        vis_cfg.use_proxy_mesh = False
+        vis_cfg.use_skeleton_overlay = True
+        vis_cfg.skeleton_overlay_mode = "screen"
+        vis_cfg.skeleton_overlay_source = "target"
+        vis_cfg.mesh_screen_outline = False
+        vis_cfg.skeleton_match_mesh_color = True
+        vis_cfg.skeleton_screen_alpha = max(float(getattr(vis_cfg, "skeleton_screen_alpha", 0.95)), 0.95)
+        vis_cfg.skeleton_screen_bone_width = max(int(getattr(vis_cfg, "skeleton_screen_bone_width", 2)), 2)
+        vis_cfg.skeleton_screen_joint_radius = max(int(getattr(vis_cfg, "skeleton_screen_joint_radius", 3)), 3)
     print(
         f"[visualize] output_dir={os.path.abspath(vis_cfg.output_dir)} "
         f"mode={vis_cfg.mode} num_samples={vis_cfg.num_samples} "
         f"random_select={getattr(vis_cfg, 'random_select', False)} "
+        f"seed={getattr(vis_cfg, 'seed', '-')} "
         f"mesh_mode={getattr(vis_cfg, 'mesh_mode', 'smpl')} "
+        f"skeleton_only={getattr(vis_cfg, 'skeleton_only', False)} "
         f"skeleton_overlay_source={getattr(vis_cfg, 'skeleton_overlay_source', 'mesh')} "
         f"max_frames={vis_cfg.max_frames} frame_stride={vis_cfg.frame_stride} "
         f"smpl_fit_stride={getattr(vis_cfg, 'smpl_fit_sample_stride', '-')} "
@@ -864,6 +931,8 @@ def main():
     vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
     vq_model = load_vq_model(cfg, vq_cfg, device)
     trans = load_trans_model(cfg, vq_cfg, vis_cfg.ckpt, device)
+    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+        trans.set_vq_codebook(vq_model.quantizer.codebook)
     dataset = build_dataset(cfg, mean, std, vis_cfg.split, int(vis_cfg.motionfix_start_id))
 
     mesh_mode = getattr(vis_cfg, "mesh_mode", "smpl")

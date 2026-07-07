@@ -64,7 +64,13 @@ if __name__ == '__main__':
     model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'model')
     ckpt_name = args.ckpt or eval_cfg.which_ckpt
     trans_ckpt = torch.load(pjoin(model_dir, ckpt_name), map_location=device, weights_only=True)
-    trans.load_state_dict(trans_ckpt['training_model'])
+    missing, unexpected = trans.load_state_dict(trans_ckpt['training_model'], strict=False)
+    if missing:
+        print(f"missing keys from ckpt: {missing[:5]}")
+    if unexpected:
+        print(f"unexpected keys from ckpt: {unexpected[:5]}")
+    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+        trans.set_vq_codebook(vq_model.quantizer.codebook)
     print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")})')
     trans.to(device).eval()
 

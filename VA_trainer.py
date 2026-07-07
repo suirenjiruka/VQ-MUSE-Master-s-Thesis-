@@ -51,12 +51,12 @@ class VA_motion_trainer:
         #ensure all input device consistant
         caption = caption.to(self.device).float() if torch.is_tensor(caption) else caption
 
-        _loss, loss_mt, _acc = self.training_model(
+        _loss, loss_mt, delta_loss, latent_loss, rank_loss, _acc = self.training_model(
             target_code_idx, source_code_idx, caption, m_lens, has_source,
             source_m_lens=src_m_lens, source_joints=src_joints, target_joints=tgt_joints
         )
 
-        return _loss, loss_mt, _acc
+        return _loss, loss_mt, delta_loss, latent_loss, rank_loss, _acc
     
     def save(self, save_pth, epoch: int):
         # save model
@@ -93,7 +93,7 @@ class VA_motion_trainer:
             checkpoint = torch.load(model_dir, map_location=self.device, weights_only=True)
 
             _, unexpected_keys = self.training_model.load_state_dict(checkpoint['training_model'], strict=False)
-            old_keys = ("text_delta_encoder.", "edit_map_head.")
+            old_keys = ("text_delta_encoder.", "edit_map_head.", "latent_MLP.", "edit_delta_head.")
             unexpected_keys = [k for k in unexpected_keys if not k.startswith(old_keys)]
             assert len(unexpected_keys) == 0
             try:
@@ -119,9 +119,13 @@ class VA_motion_trainer:
         # loss weight setup
         w_trans = self.config.loss.weight_transformer_loss
         w_mtext  = self.config.loss.weight_motion_text_InfoNCE
+        w_delta = getattr(self.config.loss, "weight_delta", 0.0)
+        w_latent = getattr(self.config.loss, "weight_latent", 0.0)
+        w_rank = getattr(self.config.loss, "weight_rank", 0.0)
 
         # tensorboard log format initialiozation
-        logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0, "accuracy": 0.0}
+        logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
+                "vq_delta": 0.0, "vq_latent": 0.0, "vq_rank": 0.0, "accuracy": 0.0}
         log_period = self.config.training.log_every
 
         # init training parameter
@@ -138,8 +142,9 @@ class VA_motion_trainer:
             for i, batch in tqdm(enumerate(train_loader)):
                 current_iter += 1
                 # calculatte loss & optimization
-                transformer_loss, InfoNCE_mt_loss, acc = self.forward(batch)
-                loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
+                transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, acc = self.forward(batch)
+                loss = (w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
+                        + w_delta * delta_loss + w_latent * latent_loss + w_rank * rank_loss)
                 self.optimizer.zero_grad()
                 if math.isnan(loss.item()):
                     continue # loss = nan, skip
@@ -151,6 +156,9 @@ class VA_motion_trainer:
                 logs['total_loss'] += loss.item()
                 logs['transformer_loss'] += transformer_loss.item()
                 logs['InfoNCE_text'] += InfoNCE_mt_loss.item()
+                logs['vq_delta'] += delta_loss.item()
+                logs['vq_latent'] += latent_loss.item()
+                logs['vq_rank'] += rank_loss.item()
                 logs['accuracy'] += acc
 
                 #print log every n steps 
@@ -158,9 +166,10 @@ class VA_motion_trainer:
                     for key, value in logs.items():
                         self.logger.add_scalar(f"train/{key}", value / log_period, current_iter)
                     # print logs
-                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
+                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, vq_delta: {logs['vq_delta'] / log_period:.4f}, vq_latent: {logs['vq_latent'] / log_period:.4f}, vq_rank: {logs['vq_rank'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
                     # reset logs
-                    logs =  {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0, "accuracy": 0.0}
+                    logs =  {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
+                             "vq_delta": 0.0, "vq_latent": 0.0, "vq_rank": 0.0, "accuracy": 0.0}
                     
                     
             #save checkpoints
@@ -173,21 +182,34 @@ class VA_motion_trainer:
 
             val_loss = 0.0
             val_acc =0.0
+            val_delta = 0.0
+            val_latent = 0.0
+            val_rank = 0.0
             val_num = len(val_loader)
 
             with torch.no_grad():
                 for i, batch in enumerate(val_loader):
-                    transformer_loss, InfoNCE_mt_loss, acc = self.forward(batch)
-                    loss = w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
+                    transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, acc = self.forward(batch)
+                    loss = (w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
+                            + w_delta * delta_loss + w_latent * latent_loss + w_rank * rank_loss)
                     val_loss += loss.item()
                     val_acc += acc
+                    val_delta += delta_loss.item()
+                    val_latent += latent_loss.item()
+                    val_rank += rank_loss.item()
                     # round to 3 decimals
                 val_loss = val_loss / val_num
                 val_acc = val_acc / val_num
-                print(f"validation result, loss: {val_loss:.3f}, accuracy: {val_acc:.3f}")
+                val_delta = val_delta / val_num
+                val_latent = val_latent / val_num
+                val_rank = val_rank / val_num
+                print(f"validation result, loss: {val_loss:.3f}, vq_delta: {val_delta:.3f}, vq_latent: {val_latent:.3f}, vq_rank: {val_rank:.3f}, accuracy: {val_acc:.3f}")
 
                 self.logger.add_scalar('Val/loss', val_loss, epoch)
                 self.logger.add_scalar('Val/acc', val_acc, epoch)
+                self.logger.add_scalar('Val/vq_delta', val_delta, epoch)
+                self.logger.add_scalar('Val/vq_latent', val_latent, epoch)
+                self.logger.add_scalar('Val/vq_rank', val_rank, epoch)
             
             gen_eval_fn = evaluation_generation_hml if gen_eval_loader is not None else evaluation_generation_hml_mixed
             gen_metrics = gen_eval_fn(

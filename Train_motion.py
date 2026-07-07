@@ -183,6 +183,8 @@ if __name__ == '__main__':
         device=device,
         full_length=cfg.data.max_motion_length // cfg.data.unit_length
     )
+    if hasattr(TV2m_transformer, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+        TV2m_transformer.set_vq_codebook(vq_model.quantizer.codebook)
     pc_vq = sum(param.numel() for param in TV2m_transformer.parameters())
     print(f"num of transformer parameter: {pc_vq / 1000} k")
 

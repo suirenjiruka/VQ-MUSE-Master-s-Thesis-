@@ -53,14 +53,144 @@ def encode_text(trans, captions, has_source):
     text_tokens, text_mask = trans.text_emb.get_text_embeddings(captions)
     text_tokens = trans.text_adaptor(text_tokens)
     text_tokens = torch.where(text_mask.unsqueeze(-1).bool(), text_tokens, 0.0)
-    text_tokens, text_mask = trans.add_task_token(text_tokens, text_mask, has_source)
+    if hasattr(trans, "add_task_token"):
+        text_tokens, text_mask = trans.add_task_token(text_tokens, text_mask, has_source)
     return text_tokens, text_mask
+
+
+def align_source_ids_to_target(trans, source_ids, m_lens, src_m_lens):
+    aligned = []
+    start = 0
+    for scale, ps in zip(trans.scales, trans.patch_sizes):
+        tgt_len = (m_lens // scale).long().clamp(min=1)
+        src_len = (src_m_lens // scale).long().clamp(min=1)
+        t = torch.arange(ps, device=source_ids.device).float().unsqueeze(0)
+        idx = torch.round(
+            t * (src_len - 1).float().unsqueeze(1)
+            / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)
+        ).long()
+        idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))
+        aligned.append(torch.gather(source_ids[:, start:start + ps], 1, idx))
+        start += ps
+    return torch.cat(aligned, dim=1)
+
+
+def align_source_tokens_to_target(trans, source_tokens, source_mask, padding_mask):
+    non_pad = ~padding_mask
+    aligned = []
+    start = 0
+    for ps in trans.patch_sizes:
+        tgt_len = non_pad[:, start:start + ps].sum(dim=1).clamp(min=1)
+        src_len = source_mask[:, start:start + ps].sum(dim=1).clamp(min=1)
+        t = torch.arange(ps, device=source_tokens.device).float().unsqueeze(0)
+        idx = torch.round(
+            t * (src_len - 1).float().unsqueeze(1)
+            / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)
+        ).long()
+        idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))
+        aligned.append(torch.gather(source_tokens[:, start:start + ps], 1, idx.unsqueeze(-1).expand(-1, -1, source_tokens.shape[-1])))
+        start += ps
+    return torch.cat(aligned, dim=1)
+
+
+def align_source_ids_to_target_by_mask(trans, source_ids, source_mask, padding_mask):
+    non_pad = ~padding_mask
+    aligned = []
+    start = 0
+    for ps in trans.patch_sizes:
+        tgt_len = non_pad[:, start:start + ps].sum(dim=1).clamp(min=1)
+        src_len = source_mask[:, start:start + ps].sum(dim=1).clamp(min=1)
+        t = torch.arange(ps, device=source_ids.device).float().unsqueeze(0)
+        idx = torch.round(
+            t * (src_len - 1).float().unsqueeze(1)
+            / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)
+        ).long()
+        idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))
+        aligned.append(torch.gather(source_ids[:, start:start + ps], 1, idx))
+        start += ps
+    return torch.cat(aligned, dim=1)
+
+
+def current_vamotion_branch_logits(trans, motion_ids, source_ids, text_tokens, toa_pe, source_pe,
+                                   source_mask, text_mask, padding_mask, has_source, use_text=True):
+    task_is_edit = has_source.view(-1, 1, 1).bool()
+    input_motion_embs = trans.motion_process(motion_ids, toa_pe)
+
+    source_tokens = trans.motion_process(source_ids, source_pe)
+    source_tokens = torch.where(task_is_edit, source_tokens, trans.null_source_embed.expand_as(source_tokens))
+    aligned_src = align_source_tokens_to_target(trans, source_tokens, source_mask, padding_mask)
+    aligned_src = torch.where(task_is_edit, aligned_src, torch.zeros_like(aligned_src))
+
+    input_text_embs = text_tokens if use_text else trans.null_text_embed.expand_as(text_tokens)
+    input_has_text = torch.ones_like(task_is_edit) if use_text else torch.zeros_like(task_is_edit)
+
+    if hasattr(trans, "text_control_encoder"):
+        source_cross = trans.source_cross(input_motion_embs, source_tokens, source_mask)
+        source_delta = source_cross - input_motion_embs
+        source_delta = torch.where(task_is_edit, source_delta, torch.zeros_like(source_delta))
+        source_base = input_motion_embs + source_delta
+
+        text_cross = trans.text_cross(source_base, input_text_embs, text_mask)
+        transformer_input = torch.where(task_is_edit, text_cross, source_base + text_cross)
+
+        source_residuals = trans.control_encoder(source_base, aligned_src, cond=source_base, padding_mask=padding_mask)
+        text_flow = text_cross - source_base
+        text_residuals = trans.text_control_encoder(source_base, text_flow, cond=text_cross, padding_mask=padding_mask)
+        text_scale = float(getattr(trans.cfg.model, "text_control_scale", 1.0))
+        control_residuals = [
+            src_r * task_is_edit.float() + txt_r * input_has_text.float() * text_scale
+            for src_r, txt_r in zip(source_residuals, text_residuals)
+        ]
+
+        output = trans.adaln_encoder(
+            x=transformer_input,
+            cond=text_cross,
+            padding_mask=padding_mask,
+            control_residuals=control_residuals
+        )
+        return trans.output_process(output)
+
+    text_cross = trans.text_cross(input_motion_embs, input_text_embs, text_mask)
+    source_cross = trans.source_cross(text_cross, source_tokens, source_mask)
+    source_cross = torch.where(task_is_edit, source_cross, text_cross)
+    transformer_input = input_motion_embs + source_cross
+
+    control_residuals = trans.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=padding_mask)
+    delta_residuals = None
+    latent_res_logits = None
+    if hasattr(trans, "run_delta_branch"):
+        aligned_src_ids = align_source_ids_to_target_by_mask(trans, source_ids, source_mask, padding_mask)
+        active_edit = task_is_edit & input_has_text
+        delta_residuals, latent_res_logits, _, _ = trans.run_delta_branch(
+            transformer_input, text_cross, source_cross, aligned_src_ids,
+            ~padding_mask, padding_mask, active_edit
+        )
+
+    output = trans.adaln_encoder(
+        x=transformer_input,
+        cond=text_cross,
+        padding_mask=padding_mask,
+        control_residuals=control_residuals,
+        control_gate=task_is_edit.float(),
+        delta_residuals=delta_residuals,
+        delta_gate=(task_is_edit & input_has_text).float() * getattr(trans, "delta_beta", 0.0)
+    )
+    logits = trans.output_process(output)
+    if hasattr(trans, "apply_vq_delta_logits"):
+        logits = trans.apply_vq_delta_logits(logits, latent_res_logits)
+    return logits
 
 
 @torch.no_grad()
 def single_branch_logits(trans, motion_ids, source_ids, text_tokens, toa_pe, source_pe,
                          source_mask, text_mask, padding_mask, has_source, use_text=True):
     # one branch only, avoids 3x CFG batch memory
+    if not hasattr(trans, "run_condition_branch"):
+        return current_vamotion_branch_logits(
+            trans, motion_ids, source_ids, text_tokens, toa_pe, source_pe,
+            source_mask, text_mask, padding_mask, has_source, use_text=use_text
+        )
+
     if use_text:
         input_text_embs = text_tokens
     else:
@@ -82,6 +212,21 @@ def avg_logp(logits, target_ids, valid_mask, weight=None):
     else:
         weight = weight.float() * valid_mask.float()
     return (token_logp * weight).sum(dim=1) / weight.sum(dim=1).clamp(min=1.0)
+
+
+def build_edit_weight(cfg, trans, batch, target_ids, source_ids, target_mask, m_lens, src_m_lens, has_source):
+    if hasattr(trans, "build_token_edit_prob"):
+        return trans.build_token_edit_prob(
+            batch["src_joints"], batch["tgt_joints"],
+            m_lens, src_m_lens, batch["has_source"], target_mask
+        )
+
+    if hasattr(trans, "build_vq_edit_weight"):
+        aligned_src_ids = align_source_ids_to_target(trans, source_ids, m_lens, src_m_lens)
+        source_present = has_source.view(-1, 1, 1).bool()
+        return trans.build_vq_edit_weight(target_ids, aligned_src_ids, target_mask, source_present)
+
+    return torch.zeros_like(target_mask, dtype=torch.float)
 
 
 def make_batch(dataset, indices, device):
@@ -127,8 +272,8 @@ def diagnose_batch(cfg, trans, vq_model, batch, device):
     shuf_logits = single_branch_logits(trans, motion_ids, source_ids, shuf_tokens, toa_pe, source_pe,
                                        source_mask, shuf_mask, padding_mask, has_source, use_text=True)
 
-    edit_prob = trans.build_token_edit_prob(batch["src_joints"], batch["tgt_joints"],
-                                            m_lens, src_m_lens, batch["has_source"], target_mask)
+    edit_prob = build_edit_weight(cfg, trans, batch, target_ids, source_ids,
+                                  target_mask, m_lens, src_m_lens, has_source)
     edit_weight = (0.1 * target_mask.float() + edit_prob).clamp(max=1.0)
 
     return {
@@ -166,6 +311,8 @@ def main():
     vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
     vq_model = load_vq_model(cfg, vq_cfg, device)
     trans = load_trans(cfg, vq_cfg, ckpt_path, device)
+    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+        trans.set_vq_codebook(vq_model.quantizer.codebook)
     dataset = build_dataset(cfg, mean, std, args.split, args.motionfix_start_id)
     indices = select_indices(dataset, "edit", 0, args.num_samples, random_select=True, seed=args.seed)
     random.shuffle(indices)

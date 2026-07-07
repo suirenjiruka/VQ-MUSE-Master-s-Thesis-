@@ -69,6 +69,10 @@ model:
   use_abs_pe: True
   use_toa_pe: True
   use_lvl_pe: False
+  use_vq_delta: True
+  delta_alpha: 0.2
+  delta_beta: 0.3
+  delta_temp: 0.15
   # fuse_mode: 'in_context'
 
 
@@ -96,6 +100,10 @@ training:
 loss:
   weight_transformer_loss: 1.0
   weight_motion_text_InfoNCE: 0.2
+  weight_delta: 0.5
+  weight_latent: 0.05
+  weight_rank: 0.05
+  delta_rank_margin: 0.2
 
 inference:
   ext: 'pool_32'

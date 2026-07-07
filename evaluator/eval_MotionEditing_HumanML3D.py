@@ -60,7 +60,11 @@ def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device):
     model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'model')
     ckpt_path = pjoin(model_dir, ckpt_name)
     trans_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    trans.load_state_dict(trans_ckpt['training_model'])
+    missing, unexpected = trans.load_state_dict(trans_ckpt['training_model'], strict=False)
+    if missing:
+        print(f"missing keys from ckpt: {missing[:5]}")
+    if unexpected:
+        print(f"unexpected keys from ckpt: {unexpected[:5]}")
     print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")})')
     return trans.to(device).eval()
 
@@ -261,6 +265,8 @@ if __name__ == '__main__':
     vq_model, vq_cfg = load_vq_model(trans_cfg, device)
     ckpt_name = args.ckpt or eval_cfg.which_ckpt
     trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device)
+    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+        trans.set_vq_codebook(vq_model.quantizer.codebook)
 
     dataset_opt_path = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'Comp_v6_KLD005', 'opt.txt')
     hml3d_opt = prepare_hml_opt(get_opt(dataset_opt_path, device), trans_cfg)

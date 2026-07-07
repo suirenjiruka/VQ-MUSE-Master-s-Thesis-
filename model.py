@@ -195,7 +195,21 @@ class VAMotion(nn.Module):
         self.control_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
                             ff_size=cfg.model.ff_size, n_layers=cfg.model.n_layers, dropout=cfg.model.dropout)
 
+        # VQ delta control branch: source code latent + text/source context -> target code delta
+        self.use_vq_delta = getattr(cfg.model, "use_vq_delta", False)
+        self.delta_alpha = float(getattr(cfg.model, "delta_alpha", 0.0))
+        self.delta_beta = float(getattr(cfg.model, "delta_beta", 0.3))
+        self.delta_temp = float(getattr(cfg.model, "delta_temp", 0.15))
+        self.delta_code_proj = nn.Linear(self.motion_dim, self.latent_dim)
+        self.delta_control_proj = nn.Linear(self.latent_dim * 4, self.latent_dim)
+        self.delta_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
+                            ff_size=cfg.model.ff_size, n_layers=cfg.model.n_layers, dropout=cfg.model.dropout)
+        self.delta_head = nn.Sequential(
+            nn.LayerNorm(self.latent_dim),
+            nn.Linear(self.latent_dim, self.motion_dim),
+        )
         self.output_process = OutputProcess_Bert(out_feats=cfg.vq.nb_code, latent_dim=self.latent_dim)
+        self.register_buffer("vq_codebook", torch.empty(0), persistent=False)
 
         #parameter initialization
         self.apply(self.__init_weights)
@@ -210,6 +224,9 @@ class VAMotion(nn.Module):
         nn.init.zeros_(self.text_adaptor.residual_block[-1].bias)
         # source branch keeps normal inner init; zero only the output boundary
         self.control_encoder.init_zero_layers()
+        self.delta_encoder.init_zero_layers()
+        nn.init.zeros_(self.delta_head[-1].weight)
+        nn.init.zeros_(self.delta_head[-1].bias)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         d = torch.cat([torch.full((ps,), i) for i, ps in enumerate(self.patch_sizes)]) #[1 * 10..., 2 * 20..., 3 * 40..., 4 * 80...]
         self.register_buffer('lvl_1L', d.contiguous())   # scale ids
@@ -315,6 +332,98 @@ class VAMotion(nn.Module):
         drop_mask = drop_mask & source_mask.bool() & has_source.view(-1, 1).bool()
         return torch.where(drop_mask, self.mask_id, source_ids)
 
+    def set_vq_codebook(self, codebook):
+        # frozen VQ table for latent-token logits
+        self.vq_codebook = codebook.detach().clone().float()
+
+    def get_vq_codebook(self, device, dtype):
+        if self.vq_codebook.numel() > 0:
+            return self.vq_codebook.to(device=device, dtype=dtype)
+        return self.token_emb.weight[:self.cfg.vq.nb_code].detach().to(device=device, dtype=dtype)
+
+    def vq_latents(self, ids, valid_mask=None):
+        safe_ids = ids.clamp(min=0, max=self.cfg.vq.nb_code - 1)
+        codebook = self.get_vq_codebook(ids.device, self.token_emb.weight.dtype)
+        latents = F.embedding(safe_ids, codebook)
+        valid = (ids >= 0) & (ids < self.cfg.vq.nb_code)
+        if valid_mask is not None:
+            valid = valid & valid_mask.bool()
+        return latents.masked_fill(~valid.unsqueeze(-1), 0.0)
+
+    def codebook_similarity_logits(self, z):
+        codebook = self.get_vq_codebook(z.device, z.dtype)
+        z_norm = F.normalize(z, dim=-1)
+        code_norm = F.normalize(codebook, dim=-1)
+        logits = torch.einsum("bld,kd->blk", z_norm, code_norm) / self.delta_temp
+        return logits.transpose(1, 2)   # [B, code, L]
+
+    def run_delta_branch(self, transformer_input, text_cross, source_cross, aligned_src_ids,
+                         target_mask, padding_mask, delta_active):
+        # extra edit path, silent for gen/null-text samples
+        if (not self.use_vq_delta) or self.delta_alpha == 0.0 and self.delta_beta == 0.0:
+            return None, None, None, None
+
+        active = delta_active.view(-1, 1, 1).bool()
+        if active.sum() == 0:
+            return None, None, None, None
+
+        valid = target_mask.bool() & active.squeeze(-1)
+        z_src = self.vq_latents(aligned_src_ids, valid)
+        z_src_proj = self.delta_code_proj(z_src)
+        delta_control = torch.cat([transformer_input, text_cross, source_cross, z_src_proj], dim=-1)
+        delta_control = self.delta_control_proj(delta_control)
+
+        delta_residuals, delta_hiddens = self.delta_encoder(
+            transformer_input, delta_control, cond=text_cross, padding_mask=padding_mask, return_hiddens=True
+        )
+        delta_pred = self.delta_head(delta_hiddens[-1]) * active.float()
+        pred_z = z_src + delta_pred
+
+        latent_logits = self.codebook_similarity_logits(pred_z)
+        src_logits = self.codebook_similarity_logits(z_src.detach()).detach()
+        latent_res_logits = (latent_logits - src_logits) * active.float().transpose(1, 2)
+        return delta_residuals, latent_res_logits, latent_logits, delta_pred
+
+    def apply_vq_delta_logits(self, token_logits, latent_res_logits):
+        if latent_res_logits is None or self.delta_alpha == 0.0:
+            return token_logits
+        return token_logits + self.delta_alpha * latent_res_logits
+
+    def vq_delta_losses(self, latent_logits, delta_pred, target_ids, source_ids,
+                        target_mask, predict_mask, active_edit):
+        zero = self.token_emb.weight.new_tensor(0.0)
+        if latent_logits is None or delta_pred is None:
+            return zero, zero, zero
+
+        active = active_edit.view(-1, 1).bool()
+        valid = target_mask.bool() & predict_mask.bool() & active
+        valid = valid & (target_ids >= 0) & (target_ids < self.cfg.vq.nb_code)
+        valid = valid & (source_ids >= 0) & (source_ids < self.cfg.vq.nb_code)
+        if valid.sum() == 0:
+            return zero, zero, zero
+
+        labels = torch.where(valid, target_ids, self.mask_id)
+        latent_loss = F.cross_entropy(latent_logits, labels, ignore_index=self.mask_id)
+
+        z_src = self.vq_latents(source_ids, valid)
+        z_tgt = self.vq_latents(target_ids, valid)
+        gt_delta = (z_tgt - z_src).detach()
+
+        weight = valid.float()
+        delta_dist = F.smooth_l1_loss(delta_pred, gt_delta, reduction="none").mean(dim=-1)
+        delta_loss = (delta_dist * weight).sum() / weight.sum().clamp(min=1.0)
+
+        pred_z = z_src + delta_pred
+        pred_n = F.normalize(pred_z, dim=-1)
+        tgt_n = F.normalize(z_tgt.detach(), dim=-1)
+        src_n = F.normalize(z_src.detach(), dim=-1)
+        dist_tgt = 1.0 - (pred_n * tgt_n).sum(dim=-1)
+        dist_src = 1.0 - (pred_n * src_n).sum(dim=-1)
+        margin = float(getattr(self.cfg.loss, "delta_rank_margin", 0.2))
+        rank_dist = F.relu(margin + dist_tgt - dist_src)
+        rank_loss = (rank_dist * weight).sum() / weight.sum().clamp(min=1.0)
+        return delta_loss, latent_loss, rank_loss
+
     def InfoNCE_text(self, motion, text_input, m_mask, t_mask, temperature=0.15):
         m_weight = self.motion_mlp(motion) # [B, L, D] -> [B, L, 1]
         t_weight = self.text_mlp(text_input)
@@ -356,6 +465,7 @@ class VAMotion(nn.Module):
         if source_m_lens is None:
             source_m_lens = m_lens   # fallback len
         source_ids, source_mask, source_pe = self.prepare_motion_ids(source_input, source_m_lens)  # source own len
+        source_ids_clean = source_ids
         #Motion vqvae embedding
         target_tokens = self.motion_process(target_ids, time_to_arrival_pe)
 
@@ -383,6 +493,7 @@ class VAMotion(nn.Module):
 
         # ControlNet canvas: align source tokens to target timeline
         aligned_src = []
+        aligned_src_ids = []
         start = 0
         for scale, ps in zip(self.scales, self.patch_sizes):
             tgt_len = (m_lens // scale).long().clamp(min=1)                                # [B]
@@ -391,8 +502,10 @@ class VAMotion(nn.Module):
             idx = torch.round(t * (src_len - 1).float().unsqueeze(1) / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)).long()
             idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))                           # stay inside source valid range
             aligned_src.append(torch.gather(source_tokens[:, start:start + ps], 1, idx.unsqueeze(-1).expand(-1, -1, source_tokens.shape[-1])))
+            aligned_src_ids.append(torch.gather(source_ids_clean[:, start:start + ps], 1, idx))
             start += ps
         aligned_src = torch.cat(aligned_src, dim=1)
+        aligned_src_ids = torch.cat(aligned_src_ids, dim=1)
         aligned_src = torch.where(source_present, aligned_src, torch.zeros_like(aligned_src))
 
         # ---- target masking: MoMask/BERT-style, per-sample uniform ratio ----
@@ -436,6 +549,12 @@ class VAMotion(nn.Module):
 
         # source control residuals; gated off for generation samples
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=~target_mask)
+        # VQ delta path is only for edit samples with real source and real text
+        active_edit = source_present & (~text_cfg_mask)
+        delta_residuals, latent_res_logits, latent_logits, delta_pred = self.run_delta_branch(
+            transformer_input, text_cross, source_cross, aligned_src_ids,
+            target_mask, ~target_mask, active_edit
+        )
 
         # AdaLN uses motion-aligned text condition
         output = self.adaln_encoder(
@@ -443,17 +562,25 @@ class VAMotion(nn.Module):
             cond=text_cross,
             padding_mask=~target_mask,
             control_residuals=control_residuals,
-            control_gate=source_present.float()
+            control_gate=source_present.float(),
+            delta_residuals=delta_residuals,
+            delta_gate=active_edit.float() * self.delta_beta
         )
-        logits = self.output_process(output)
+        raw_logits = self.output_process(output)
+        logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
 
         # masked token CE
         ce_loss, _, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
 
+        delta_loss, latent_loss, rank_loss = self.vq_delta_losses(
+            latent_logits, delta_pred, target_ids, aligned_src_ids,
+            target_mask, predict_mask, active_edit
+        )
+
         #Info_NCE loss computation
         loss_mt = self.InfoNCE_text(target_tokens, text_tokens_for_loss, target_mask, text_mask, temperature=0.15)
 
-        return ce_loss, loss_mt.mean(), acc
+        return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, acc
     
     def forward_with_cond_scale(self, motion_ids, source_ids, text_embs, time_to_arrival_pe, source_pe,
                                 source_mask, text_mask, motion_padding_mask, has_source, mask_ratio,
@@ -479,6 +606,7 @@ class VAMotion(nn.Module):
         input_text_embs = torch.cat([null_text, null_text, text_embs], dim=0)
         task_is_edit = has_source.view(-1, 1, 1).bool()
         input_has_source = torch.cat([torch.zeros_like(task_is_edit), task_is_edit, task_is_edit], dim=0)
+        input_has_text = torch.cat([torch.zeros_like(task_is_edit), torch.zeros_like(task_is_edit), torch.ones_like(task_is_edit)], dim=0)
 
         # source condition (null for branch A, or for has_source=0 samples)
         input_motion_embs = self.motion_process(input_motion_ids, input_toa_pe)
@@ -488,6 +616,7 @@ class VAMotion(nn.Module):
         # ControlNet canvas: same aligned gather as training, per-scale lens derived from the masks
         non_pad = ~input_motion_padding_mask
         aligned_src = []
+        aligned_src_ids = []
         start = 0
         for ps in self.patch_sizes:
             tgt_len = non_pad[:, start:start + ps].sum(dim=1).clamp(min=1)                 # [3B]
@@ -496,8 +625,10 @@ class VAMotion(nn.Module):
             idx = torch.round(t * (src_len - 1).float().unsqueeze(1) / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)).long()
             idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))                           # stay inside source valid range
             aligned_src.append(torch.gather(source_tokens[:, start:start + ps], 1, idx.unsqueeze(-1).expand(-1, -1, source_tokens.shape[-1])))
+            aligned_src_ids.append(torch.gather(input_source_ids[:, start:start + ps], 1, idx))
             start += ps
         aligned_src = torch.cat(aligned_src, dim=1)
+        aligned_src_ids = torch.cat(aligned_src_ids, dim=1)
         aligned_src = torch.where(input_has_source, aligned_src, torch.zeros_like(aligned_src))
 
         # HML-1 style CA
@@ -508,6 +639,11 @@ class VAMotion(nn.Module):
 
         # source branch: branch A gate 0, branch B/C use aligned source
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=input_motion_padding_mask)
+        active_edit = input_has_source & input_has_text
+        delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
+            transformer_input, text_cross, source_cross, aligned_src_ids,
+            non_pad, input_motion_padding_mask, active_edit
+        )
 
         # predict token logits from current masked ids
         output = self.adaln_encoder(
@@ -515,9 +651,12 @@ class VAMotion(nn.Module):
             cond=text_cross,
             padding_mask=input_motion_padding_mask,
             control_residuals=control_residuals,
-            control_gate=input_has_source.float()
+            control_gate=input_has_source.float(),
+            delta_residuals=delta_residuals,
+            delta_gate=active_edit.float() * self.delta_beta
         )
         output_logits = self.output_process(output) # [B, L, dim] -> [B, dim, L]
+        output_logits = self.apply_vq_delta_logits(output_logits, latent_res_logits)
         uncond_logits, source_logits, full_logits = output_logits.chunk(3, dim=0)
 
         if torch.is_tensor(cond_scale):
