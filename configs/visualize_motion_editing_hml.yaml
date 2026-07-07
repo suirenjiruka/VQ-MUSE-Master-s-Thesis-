@@ -11,7 +11,7 @@ num_samples: 4
 start_index: 0
 random_select: True
 motionfix_start_id: 400000
-seed: 18562
+seed: 17877
 
 # Sampling
 time_steps: 20

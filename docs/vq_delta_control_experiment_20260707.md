@@ -296,3 +296,73 @@ keep source branch stable,
 but look for a stronger text instruction learning path that affects motion amplitude/content,
 not only token-neighbor preference in VQ latent space.
 ```
+
+## Review Notes: Why The Gain Was Small
+
+This design is not only a final-logit trick. It has two control paths:
+
+```text
+1. layer-wise delta residuals:
+   delta_encoder -> delta_residuals -> main AdaLN blocks
+
+2. final VQ latent residual logits:
+   final_logits = raw_logits + delta_alpha * latent_residual_logits
+```
+
+So the weak gain should not be explained as "late fusion only". The more likely issue is control responsibility:
+
+```text
+delta input = transformer_input + text_cross + source_cross + z_src
+```
+
+`transformer_input` and `source_cross` are already source-dominant. The branch can therefore learn a safe correction around source motion instead of a clean text-driven edit direction.
+
+Another issue is the VQ latent target:
+
+```text
+z_tgt - z_src
+```
+
+This is a reconstruction/codebook displacement, not guaranteed to be a semantic edit vector. It may include pose mismatch, timing shift, quantization noise, and alignment error. As a result, the branch can move tokens closer to target without producing a complete kinematic edit.
+
+## Optimization Ideas To Keep
+
+Make the delta signal cleaner before increasing its strength:
+
+```text
+source branch:
+  motion prior / source structure
+
+delta branch:
+  edit text -> source-to-target residual
+```
+
+Recommended cleanup:
+
+```text
+1. Reduce dependency on source_cross inside delta control.
+2. Keep z_src and current motion/canvas state.
+3. Use purer edit-text feature as the main condition.
+4. Keep generation samples fully gated out.
+```
+
+Weight tuning should come after signal cleanup. Current values are conservative:
+
+```yaml
+delta_beta: 0.3
+delta_alpha: 0.2
+```
+
+Possible schedule if the delta branch is stable:
+
+```text
+early:
+  delta_beta 0.1 - 0.3
+  delta_alpha 0.1 - 0.2
+
+later:
+  delta_beta 0.5 - 0.8
+  delta_alpha 0.3 - 0.5
+```
+
+Do not simply enlarge these weights before the branch learns a reliable text-driven residual. Otherwise it may only amplify source-dominant weak corrections.
