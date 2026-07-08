@@ -1,5 +1,6 @@
 import os
 import argparse
+import time
 import torch
 import numpy as np
 from tqdm import tqdm
@@ -18,6 +19,11 @@ from utils.metrics import calculate_frechet_distance, euclidean_distance_matrix
 from dataset.HumanML3D_dataset import Text2MotionDatasetEval, HML3DMotionEditDataset, collate_fn
 from evaluator.evaluator import evaluation_motion_editing_hml
 from evaluator.tmr_eval_wrapper import TMREvaluatorWrapper
+
+
+def sync_cuda_if_needed(device):
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def load_mean_std(cfg):
@@ -138,6 +144,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
 
     text_emb_list, gt_emb_list, pred_emb_list = [], [], []
     nb_sample = 0
+    inference_seconds = 0.0
 
     for batch in tqdm(eval_loader):
         word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, _, _ = batch
@@ -147,12 +154,16 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         has_source = torch.zeros(bs, device=device, dtype=torch.long)
 
         # Generate with null source condition, which is the generation branch of the current model
+        sync_cuda_if_needed(device)
+        start_time = time.perf_counter()
         mids = trans.generate(
             None, clip_text, m_length // unit_length, has_source, t_drop=0,
             timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
+        sync_cuda_if_needed(device)
+        inference_seconds += time.perf_counter() - start_time
 
         text_emb, gt_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
         text_emb_pred, pred_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
@@ -182,6 +193,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
     return {
         "r1": r_precision[0], "r2": r_precision[1], "r3": r_precision[2],
         "matching": matching, "fid": fid, "diversity": diversity, "num_samples": nb_sample,
+        "aits": inference_seconds / nb_sample,
     }
 
 
@@ -201,7 +213,7 @@ def format_generation(metrics):
     return (
         f"\tGEN Samples: {metrics['num_samples']}\n"
         f"\tGEN R@1/2/3: {metrics['r1']:.4f} / {metrics['r2']:.4f} / {metrics['r3']:.4f}\n"
-        f"\tGEN Matching: {metrics['matching']:.4f}, FID: {metrics['fid']:.4f}, Diversity: {metrics['diversity']:.4f}\n"
+        f"\tGEN Matching: {metrics['matching']:.4f}, FID: {metrics['fid']:.4f}, Diversity: {metrics['diversity']:.4f}, AITS: {metrics['aits']:.4f}s\n"
     )
 
 
@@ -210,7 +222,7 @@ def format_editing(metrics):
         f"\tEDIT Samples: {metrics['num_samples']}\n"
         f"\tEDIT G2T R@1/2/3: {metrics['g2t_r1']:.4f} / {metrics['g2t_r2']:.4f} / {metrics['g2t_r3']:.4f}, AvgR: {metrics['g2t_avgr']:.2f}\n"
         f"\tEDIT G2S R@1/2/3: {metrics['g2s_r1']:.4f} / {metrics['g2s_r2']:.4f} / {metrics['g2s_r3']:.4f}, AvgR: {metrics['g2s_avgr']:.2f}\n"
-        f"\tEDIT TMR-FID: {metrics['fid']:.4f}, TMR-Diversity: {metrics['diversity']:.4f}\n"
+        f"\tEDIT TMR-FID: {metrics['fid']:.4f}, TMR-Diversity: {metrics['diversity']:.4f}, AITS: {metrics['aits']:.4f}s\n"
     )
 
 
@@ -343,13 +355,13 @@ if __name__ == '__main__':
 
             write_summary('--- Generation ---', gen_metrics_list, [
                 ('R@1', 'r1', 4), ('R@2', 'r2', 4), ('R@3', 'r3', 4),
-                ('Matching', 'matching', 4), ('FID', 'fid', 4), ('Diversity', 'diversity', 4),
+                ('Matching', 'matching', 4), ('FID', 'fid', 4), ('Diversity', 'diversity', 4), ('AITS', 'aits', 4),
             ], f)
 
             write_summary('--- Editing ---', edit_metrics_list, [
                 ('G2T R@1', 'g2t_r1', 4), ('G2T R@2', 'g2t_r2', 4), ('G2T R@3', 'g2t_r3', 4), ('G2T AvgR', 'g2t_avgr', 2),
                 ('G2S R@1', 'g2s_r1', 4), ('G2S R@2', 'g2s_r2', 4), ('G2S R@3', 'g2s_r3', 4), ('G2S AvgR', 'g2s_avgr', 2),
-                ('TMR-FID', 'fid', 4), ('TMR-Diversity', 'diversity', 4),
+                ('TMR-FID', 'fid', 4), ('TMR-Diversity', 'diversity', 4), ('AITS', 'aits', 4),
             ], f)
 
     f.close()

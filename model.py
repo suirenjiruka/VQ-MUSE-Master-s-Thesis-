@@ -200,10 +200,6 @@ class VAMotion(nn.Module):
         self.delta_alpha = float(getattr(cfg.model, "delta_alpha", 0.0))
         self.delta_beta = float(getattr(cfg.model, "delta_beta", 0.3))
         self.delta_temp = float(getattr(cfg.model, "delta_temp", 0.15))
-        self.use_latent_classifier = getattr(cfg.model, "use_latent_classifier", False)
-        self.latent_w_min = float(getattr(cfg.model, "latent_w_min", 0.5))
-        self.latent_w_max = float(getattr(cfg.model, "latent_w_max", 0.9))
-        self.raw_w_sum = float(getattr(cfg.model, "raw_w_sum", 1.4))
         self.delta_code_proj = nn.Linear(self.motion_dim, self.latent_dim)
         self.delta_control_proj = nn.Linear(self.latent_dim * 4, self.latent_dim)
         self.delta_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
@@ -212,6 +208,10 @@ class VAMotion(nn.Module):
             nn.LayerNorm(self.latent_dim),
             nn.Linear(self.latent_dim, self.motion_dim),
         )
+        self.same_src_margin = float(getattr(cfg.loss, "same_src_margin", 1.0))
+        self.same_src_max = int(getattr(cfg.loss, "same_src_max", 16))
+        self.use_same_src_loss = float(getattr(cfg.loss, "weight_same_src", 0.0)) > 0.0
+        self.eval_same_src_metric = bool(getattr(cfg.loss, "eval_same_src_metric", True))
         self.output_process = OutputProcess_Bert(out_feats=cfg.vq.nb_code, latent_dim=self.latent_dim)
         self.register_buffer("vq_codebook", torch.empty(0), persistent=False)
 
@@ -362,9 +362,9 @@ class VAMotion(nn.Module):
         return logits.transpose(1, 2)   # [B, code, L]
 
     def run_delta_branch(self, transformer_input, text_cross, source_cross, aligned_src_ids,
-                         target_mask, padding_mask, delta_active):
+                         target_mask, padding_mask, delta_active, need_latent=True):
         # extra edit path, silent for gen/null-text samples
-        if (not self.use_vq_delta) or (self.delta_alpha == 0.0 and self.delta_beta == 0.0 and not self.use_latent_classifier):
+        if (not self.use_vq_delta) or (self.delta_alpha == 0.0 and self.delta_beta == 0.0 and not need_latent):
             return None, None, None, None
 
         active = delta_active.view(-1, 1, 1).bool()
@@ -381,11 +381,15 @@ class VAMotion(nn.Module):
             transformer_input, delta_control, cond=text_cross, padding_mask=padding_mask, return_hiddens=True
         )
         delta_pred = self.delta_head(delta_hiddens[-1]) * active.float()
-        pred_z = z_src + delta_pred
 
-        latent_logits = self.codebook_similarity_logits(pred_z)
-        src_logits = self.codebook_similarity_logits(z_src.detach()).detach()
-        latent_res_logits = (latent_logits - src_logits) * active.float().transpose(1, 2)
+        latent_logits = None
+        latent_res_logits = None
+        if need_latent or self.delta_alpha != 0.0:
+            pred_z = z_src + delta_pred
+            latent_logits = self.codebook_similarity_logits(pred_z)
+            if self.delta_alpha != 0.0:
+                src_logits = self.codebook_similarity_logits(z_src.detach()).detach()
+                latent_res_logits = (latent_logits - src_logits) * active.float().transpose(1, 2)
         return delta_residuals, latent_res_logits, latent_logits, delta_pred
 
     def apply_vq_delta_logits(self, token_logits, latent_res_logits):
@@ -393,26 +397,107 @@ class VAMotion(nn.Module):
             return token_logits
         return token_logits + self.delta_alpha * latent_res_logits
 
-    def latent_classifier_logits(self, raw_logits, latent_logits, active_edit, mask_ratio):
-        # edit uses latent classifier as main path; gen keeps raw logits
-        if (not self.use_latent_classifier) or latent_logits is None:
-            return raw_logits
+    def same_source_text_loss(self, text_tokens, text_mask, source_tokens, source_mask,
+                              aligned_src, aligned_src_ids, target_ids, target_mask, time_to_arrival_pe,
+                              source_present, same_target_ids, same_target_mask, same_src_text, same_src_flag):
+        # all-mask same-source contrast; only changed tokens count
+        zero = source_tokens.new_tensor(0.0)
+        use_same_src = self.use_same_src_loss or ((not self.training) and self.eval_same_src_metric)
+        if ((not use_same_src) or same_src_text is None or same_src_flag is None or
+                same_target_ids is None or same_target_mask is None):
+            return zero, zero
 
-        t = mask_ratio.to(raw_logits.device, dtype=raw_logits.dtype).view(-1)
-        if t.numel() == 1:
-            t = t.expand(raw_logits.shape[0])
-        elif t.numel() != raw_logits.shape[0]:
-            repeat = raw_logits.shape[0] // t.numel()
-            if repeat * t.numel() != raw_logits.shape[0]:
-                t = t.mean().expand(raw_logits.shape[0])
-            else:
-                t = t.repeat(repeat)
-        t = t.clamp(0.0, 1.0).view(-1, 1, 1)
+        if torch.is_tensor(same_src_flag):
+            has_neg = same_src_flag.to(source_tokens.device).view(-1).bool()
+        else:
+            has_neg = torch.tensor(same_src_flag, device=source_tokens.device).view(-1).bool()
+        active = has_neg & source_present.view(-1).bool()
+        if active.sum() == 0:
+            return zero, zero
 
-        latent_w = self.latent_w_min + (self.latent_w_max - self.latent_w_min) * t
-        raw_w = self.raw_w_sum - latent_w
-        mixed_logits = latent_w * latent_logits + raw_w * raw_logits
-        return torch.where(active_edit.bool(), mixed_logits, raw_logits)
+        idx = active.nonzero(as_tuple=False).view(-1)
+        if self.same_src_max > 0 and idx.numel() > self.same_src_max:
+            perm = torch.randperm(idx.numel(), device=idx.device)[:self.same_src_max]
+            idx = idx[perm]
+
+        text_list = list(same_src_text)
+        neg_text = [text_list[int(i)] for i in idx.detach().cpu().tolist()]
+        with torch.no_grad():
+            neg_tokens, neg_mask = self.text_emb.get_text_embeddings(neg_text)
+        neg_tokens = self.text_adaptor(neg_tokens)
+        neg_tokens = torch.where(neg_mask.unsqueeze(-1).bool(), neg_tokens, 0.0)
+
+        tm = target_mask[idx].bool()
+        all_mask_ids = torch.where(tm, self.mask_id, self.pad_id)
+        mm = self.motion_process(all_mask_ids, time_to_arrival_pe[idx])
+        st = source_tokens[idx]
+        sm = source_mask[idx]
+        asp = aligned_src[idx]
+        asi = aligned_src_ids[idx]
+        sp = source_present[idx]
+        ae = torch.ones(idx.numel(), 1, 1, device=source_tokens.device, dtype=torch.bool)
+
+        # align target_b to target_a timeline for changed-token mask
+        same_ids = same_target_ids[idx]
+        same_mask = same_target_mask[idx].bool()
+        aligned_same_ids, aligned_same_mask = [], []
+        start = 0
+        for ps in self.patch_sizes:
+            tgt_len = tm[:, start:start + ps].sum(dim=1).clamp(min=1)
+            same_len = same_mask[:, start:start + ps].sum(dim=1).clamp(min=1)
+            t = torch.arange(ps, device=source_tokens.device).float().unsqueeze(0)
+            gather_idx = torch.round(t * (same_len - 1).float().unsqueeze(1) / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)).long()
+            gather_idx = torch.minimum(gather_idx, (same_len - 1).unsqueeze(1))
+            aligned_same_ids.append(torch.gather(same_ids[:, start:start + ps], 1, gather_idx))
+            aligned_same_mask.append(torch.gather(same_mask[:, start:start + ps], 1, gather_idx))
+            start += ps
+        aligned_same_ids = torch.cat(aligned_same_ids, dim=1)
+        aligned_same_mask = torch.cat(aligned_same_mask, dim=1)
+
+        valid_a = tm & (target_ids[idx] >= 0) & (target_ids[idx] < self.cfg.vq.nb_code)
+        valid_b = aligned_same_mask & (aligned_same_ids >= 0) & (aligned_same_ids < self.cfg.vq.nb_code)
+        changed = valid_a & valid_b & target_ids[idx].ne(aligned_same_ids)
+        keep = changed.any(dim=1)
+        if keep.sum() == 0:
+            return zero, zero
+
+        def run_text_branch(cond_tokens, cond_mask):
+            text_cross = self.text_cross(mm, cond_tokens, cond_mask)
+            source_cross = self.source_cross(text_cross, st, sm)
+            source_cross = torch.where(sp, source_cross, text_cross)
+            transformer_input = mm + source_cross
+            control_residuals = self.control_encoder(transformer_input, asp, cond=text_cross, padding_mask=~tm)
+            delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
+                transformer_input, text_cross, source_cross, asi, tm, ~tm, ae, need_latent=False
+            )
+            output = self.adaln_encoder(
+                x=transformer_input,
+                cond=text_cross,
+                padding_mask=~tm,
+                control_residuals=control_residuals,
+                control_gate=ae.float(),
+                delta_residuals=delta_residuals,
+                delta_gate=ae.float() * self.delta_beta
+            )
+            return self.apply_vq_delta_logits(self.output_process(output), latent_res_logits)
+
+        correct_logits = run_text_branch(text_tokens[idx], text_mask[idx])
+        wrong_logits = run_text_branch(neg_tokens, neg_mask)
+        tgt_a = target_ids[idx].clamp(min=0, max=self.cfg.vq.nb_code - 1)
+        tgt_b = aligned_same_ids.clamp(min=0, max=self.cfg.vq.nb_code - 1)
+        correct_logp = F.log_softmax(correct_logits, dim=1)
+        wrong_logp = F.log_softmax(wrong_logits, dim=1)
+        a_on_a = correct_logp.gather(1, tgt_a.unsqueeze(1)).squeeze(1)
+        a_on_b = correct_logp.gather(1, tgt_b.unsqueeze(1)).squeeze(1)
+        b_on_a = wrong_logp.gather(1, tgt_a.unsqueeze(1)).squeeze(1)
+        b_on_b = wrong_logp.gather(1, tgt_b.unsqueeze(1)).squeeze(1)
+
+        denom = changed.float().sum(dim=1).clamp(min=1.0)
+        gap_a = ((a_on_a - b_on_a) * changed.float()).sum(dim=1) / denom
+        gap_b = ((b_on_b - a_on_b) * changed.float()).sum(dim=1) / denom
+        gap_a, gap_b = gap_a[keep], gap_b[keep]
+        loss = (F.relu(self.same_src_margin - gap_a) + F.relu(self.same_src_margin - gap_b)).mean() * 0.5
+        return loss, ((gap_a + gap_b) * 0.5).mean()
 
     def vq_delta_losses(self, latent_logits, delta_pred, target_ids, source_ids,
                         target_mask, predict_mask, active_edit):
@@ -484,9 +569,13 @@ class VAMotion(nn.Module):
         return mask 
 
     def forward(self, target_input, source_input, text_input, m_lens, has_source, source_m_lens=None,
-                source_joints=None, target_joints=None):
+                source_joints=None, target_joints=None, same_src_text=None, same_src_flag=None,
+                same_target_input=None, same_m_lens=None):
         # target/source input are both multi-scale VQ ids
         target_ids, target_mask, time_to_arrival_pe = self.prepare_motion_ids(target_input, m_lens)
+        same_target_ids, same_target_mask = None, None
+        if same_target_input is not None and same_m_lens is not None:
+            same_target_ids, same_target_mask, _ = self.prepare_motion_ids(same_target_input, same_m_lens)
         if source_m_lens is None:
             source_m_lens = m_lens   # fallback len
         source_ids, source_mask, source_pe = self.prepare_motion_ids(source_input, source_m_lens)  # source own len
@@ -592,10 +681,7 @@ class VAMotion(nn.Module):
             delta_gate=active_edit.float() * self.delta_beta
         )
         raw_logits = self.output_process(output)
-        if self.use_latent_classifier:
-            logits = self.latent_classifier_logits(raw_logits, latent_logits, active_edit, rand_mask_probs)
-        else:
-            logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
+        logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
 
         # masked token CE
         ce_loss, _, acc = cal_performance(logits, labels, ignore_index=self.mask_id)
@@ -604,11 +690,16 @@ class VAMotion(nn.Module):
             latent_logits, delta_pred, target_ids, aligned_src_ids,
             target_mask, predict_mask, active_edit
         )
+        same_loss, same_gap = self.same_source_text_loss(
+            text_tokens_for_loss, text_mask, source_tokens, source_mask,
+            aligned_src, aligned_src_ids, target_ids, target_mask, time_to_arrival_pe,
+            source_present, same_target_ids, same_target_mask, same_src_text, same_src_flag
+        )
 
         #Info_NCE loss computation
         loss_mt = self.InfoNCE_text(target_tokens, text_tokens_for_loss, target_mask, text_mask, temperature=0.15)
 
-        return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, acc
+        return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, same_loss, same_gap, acc
     
     def forward_with_cond_scale(self, motion_ids, source_ids, text_embs, time_to_arrival_pe, source_pe,
                                 source_mask, text_mask, motion_padding_mask, has_source, mask_ratio,
@@ -668,9 +759,9 @@ class VAMotion(nn.Module):
         # source branch: branch A gate 0, branch B/C use aligned source
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=input_motion_padding_mask)
         active_edit = input_has_source & input_has_text
-        delta_residuals, latent_res_logits, latent_logits, _ = self.run_delta_branch(
+        delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
             transformer_input, text_cross, source_cross, aligned_src_ids,
-            non_pad, input_motion_padding_mask, active_edit
+            non_pad, input_motion_padding_mask, active_edit, need_latent=False
         )
 
         # predict token logits from current masked ids
@@ -683,11 +774,8 @@ class VAMotion(nn.Module):
             delta_residuals=delta_residuals,
             delta_gate=active_edit.float() * self.delta_beta
         )
-        raw_logits = self.output_process(output) # [B, L, dim] -> [B, dim, L]
-        if self.use_latent_classifier:
-            output_logits = raw_logits
-        else:
-            output_logits = self.apply_vq_delta_logits(raw_logits, latent_res_logits)
+        output_logits = self.output_process(output) # [B, L, dim] -> [B, dim, L]
+        output_logits = self.apply_vq_delta_logits(output_logits, latent_res_logits)
         uncond_logits, source_logits, full_logits = output_logits.chunk(3, dim=0)
 
         if torch.is_tensor(cond_scale):
@@ -697,9 +785,6 @@ class VAMotion(nn.Module):
 
         # source_scale controls preservation strength, cond_scale controls edit-text strength
         scaled_logits = uncond_logits + source_scale * (source_logits - uncond_logits) + cond_scale * (full_logits - source_logits)
-        if self.use_latent_classifier and latent_logits is not None:
-            _, _, latent_full_logits = latent_logits.chunk(3, dim=0)
-            scaled_logits = self.latent_classifier_logits(scaled_logits, latent_full_logits, task_is_edit, mask_ratio)
         return scaled_logits #[B, dim, L]
 
     @torch.no_grad()

@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -7,6 +8,10 @@ from utils.metrics import *
 '''
 Code is borrowed from the framework of SnapMogen, including VQ-model, traing process, and most relatted configuratioon
 '''
+
+def sync_cuda_if_needed(device):
+    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(device)
 
 def calculate_retrieval_metrics(query_emb, gallery_emb, top_k=3):
     dist_mat = euclidean_distance_matrix(query_emb, gallery_emb)
@@ -32,6 +37,7 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
     r_precision_sum = np.zeros(3)
     matching_sum = 0.0
     nb_sample = 0
+    inference_seconds = 0.0
 
     for batch in tqdm(eval_loader):
         caption, src_motion, tgt_motion, m_length, src_joints, tgt_joints, has_source, task_type, name = batch[:9]
@@ -52,12 +58,16 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
         sent_len = sent_len[gen_mask].to(device).long()
         gen_has_source = torch.zeros_like(m_length, device=device)
 
+        sync_cuda_if_needed(device)
+        start_time = time.perf_counter()
         mids = trans.generate(
             None, caption, m_length // unit_length, gen_has_source, t_drop=0,
             timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
+        sync_cuda_if_needed(device)
+        inference_seconds += time.perf_counter() - start_time
 
         # HML text encoder uses pack_padded_sequence, so caption lengths must be sorted.
         sort_idx = torch.argsort(sent_len, descending=True)
@@ -98,13 +108,14 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
     metrics = {
         "r1": r_precision[0], "r2": r_precision[1], "r3": r_precision[2],
         "matching": matching, "fid": fid, "diversity": diversity, "num_samples": nb_sample,
+        "aits": inference_seconds / nb_sample,
     }
 
     if draw:
         print(
             f"--> Gen Eval Ep {ep}: "
             f"R@1/2/3 {r_precision[0]:.4f}/{r_precision[1]:.4f}/{r_precision[2]:.4f}; "
-            f"Matching {matching:.4f}; FID {fid:.4f}; Diversity {diversity:.4f}"
+            f"Matching {matching:.4f}; FID {fid:.4f}; Diversity {diversity:.4f}; AITS {metrics['aits']:.4f}s"
         )
         writer.add_scalar('GenEval/R1', metrics["r1"], ep)
         writer.add_scalar('GenEval/R2', metrics["r2"], ep)
@@ -112,6 +123,7 @@ def evaluation_generation_hml_mixed(eval_loader, trans, vq_model, writer, ep, ev
         writer.add_scalar('GenEval/Matching', metrics["matching"], ep)
         writer.add_scalar('GenEval/FID', metrics["fid"], ep)
         writer.add_scalar('GenEval/Diversity', metrics["diversity"], ep)
+        writer.add_scalar('GenEval/AITS', metrics["aits"], ep)
 
     return metrics
 
@@ -125,6 +137,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
     r_precision_sum = np.zeros(3)
     matching_sum = 0.0
     nb_sample = 0
+    inference_seconds = 0.0
 
     for batch in tqdm(eval_loader):
         word_embeddings, pos_one_hots, caption, sent_len, tgt_motion, m_length, _, _ = batch
@@ -132,12 +145,16 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
         m_length = m_length.to(device).long()
         gen_has_source = torch.zeros_like(m_length, device=device)
 
+        sync_cuda_if_needed(device)
+        start_time = time.perf_counter()
         mids = trans.generate(
             None, caption, m_length // unit_length, gen_has_source, t_drop=0,
             timesteps=time_steps, cond_scale=cond_scale, source_cond_scale=source_cond_scale, temperature=temperature,
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
+        sync_cuda_if_needed(device)
+        inference_seconds += time.perf_counter() - start_time
 
         text_emb, gt_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, tgt_motion, m_length)
         text_emb_pred, pred_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
@@ -169,13 +186,14 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
     metrics = {
         "r1": r_precision[0], "r2": r_precision[1], "r3": r_precision[2],
         "matching": matching, "fid": fid, "diversity": diversity, "num_samples": nb_sample,
+        "aits": inference_seconds / nb_sample,
     }
 
     if draw:
         print(
             f"--> Gen Eval Ep {ep}: "
             f"R@1/2/3 {r_precision[0]:.4f}/{r_precision[1]:.4f}/{r_precision[2]:.4f}; "
-            f"Matching {matching:.4f}; FID {fid:.4f}; Diversity {diversity:.4f}"
+            f"Matching {matching:.4f}; FID {fid:.4f}; Diversity {diversity:.4f}; AITS {metrics['aits']:.4f}s"
         )
         writer.add_scalar('GenEval/R1', metrics["r1"], ep)
         writer.add_scalar('GenEval/R2', metrics["r2"], ep)
@@ -183,6 +201,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, writer, ep, eval_wra
         writer.add_scalar('GenEval/Matching', metrics["matching"], ep)
         writer.add_scalar('GenEval/FID', metrics["fid"], ep)
         writer.add_scalar('GenEval/Diversity', metrics["diversity"], ep)
+        writer.add_scalar('GenEval/AITS', metrics["aits"], ep)
 
     return metrics
 
@@ -201,6 +220,7 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
     batch_g2s_rank = []
     batch_nb_sample = 0
     nb_sample = 0
+    inference_seconds = 0.0
 
     for batch in tqdm(eval_loader):
         caption, src_motion, tgt_motion, m_length, src_joints, tgt_joints, has_source, task_type, name = batch[:9]
@@ -217,6 +237,8 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
         edit_has_source = torch.ones_like(m_length, device=device)
 
         # source encode, edit generate, decode
+        sync_cuda_if_needed(device)
+        start_time = time.perf_counter()
         source_code_idx, _ = vq_model.encode(src_motion[..., :trans.cfg.data.dim_pose], src_m_length)
         mids = trans.generate(
             source_code_idx, caption, m_length // unit_length, edit_has_source, t_drop=0,
@@ -225,6 +247,8 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
             topk_filter_thres=topk_filter_thres, gsample=gsample
         )
         pred_motion = vq_model.forward_decoder(mids, m_length.clone())
+        sync_cuda_if_needed(device)
+        inference_seconds += time.perf_counter() - start_time
 
         # MotionFix-style retrieval is motion-to-motion: generated -> target/source
         source_emb = get_motion_embeddings_aligned(eval_wrapper, src_motion, src_m_length)
@@ -283,6 +307,7 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
         "global_g2t_r1": global_g2t_r[0], "global_g2t_r2": global_g2t_r[1], "global_g2t_r3": global_g2t_r[2], "global_g2t_avgr": global_g2t_rank,
         "global_g2s_r1": global_g2s_r[0], "global_g2s_r2": global_g2s_r[1], "global_g2s_r3": global_g2s_r[2], "global_g2s_avgr": global_g2s_rank,
         "fid": fid, "diversity": diversity, "num_samples": nb_sample, "batch_num_samples": batch_nb_sample,
+        "aits": inference_seconds / nb_sample,
     }
 
     if draw:
@@ -290,7 +315,7 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
             f"--> MotionEdit Eval Ep {ep}: "
             f"G2T R@1/2/3 {batch_g2t_r[0]:.4f}/{batch_g2t_r[1]:.4f}/{batch_g2t_r[2]:.4f}, AvgR {batch_g2t_rank:.2f}; "
             f"G2S R@1/2/3 {batch_g2s_r[0]:.4f}/{batch_g2s_r[1]:.4f}/{batch_g2s_r[2]:.4f}, AvgR {batch_g2s_rank:.2f}; "
-            f"TMR-FID {fid:.4f}, TMR-Diversity {diversity:.4f}"
+            f"TMR-FID {fid:.4f}, TMR-Diversity {diversity:.4f}; AITS {metrics['aits']:.4f}s"
         )
         print(
             f"    Global monitor: "
@@ -309,6 +334,7 @@ def evaluation_motion_editing_hml(eval_loader, trans, vq_model, writer, ep, eval
         writer.add_scalar('EditEval_Global/G2S_R1', metrics["global_g2s_r1"], ep)
         writer.add_scalar('EditEval/TMR_FID', metrics["fid"], ep)
         writer.add_scalar('EditEval/TMR_Diversity', metrics["diversity"], ep)
+        writer.add_scalar('EditEval/AITS', metrics["aits"], ep)
 
     return metrics
 

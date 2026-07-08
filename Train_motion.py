@@ -212,12 +212,15 @@ if __name__ == '__main__':
 
     loader_collate_fn = collate_fn if args.dataset == DATASET_HML3D else None
 
-    # oversample edit pairs to ~50/50 so the control branch / CFG source branch get enough gradient
+    # task mix, keep gen dominant for regularization
     is_edit = np.array([train_dataset.data_dict[name][7] for name in train_dataset.name_list], dtype=np.int64)
     n_edit, n_gen = int(is_edit.sum()), int(len(is_edit) - is_edit.sum())
     print(f"train samples: gen {n_gen}, edit {n_edit}")
     if n_edit > 0 and n_gen > 0:
-        sample_weights = np.where(is_edit == 1, 0.5 / n_edit, 0.5 / n_gen)
+        edit_ratio = float(getattr(cfg.training, "edit_sample_ratio", 0.5))
+        edit_ratio = min(max(edit_ratio, 0.0), 1.0)
+        print(f"task sample ratio: gen {1.0 - edit_ratio:.2f}, edit {edit_ratio:.2f}")
+        sample_weights = np.where(is_edit == 1, edit_ratio / n_edit, (1.0 - edit_ratio) / n_gen)
         train_sampler = WeightedRandomSampler(torch.from_numpy(sample_weights).double(), num_samples=len(is_edit), replacement=True)
         train_loader = DataLoader(train_dataset, batch_size=cfg.training.batch_size, drop_last=True, num_workers=8, sampler=train_sampler, pin_memory=True, collate_fn=loader_collate_fn)
     else:

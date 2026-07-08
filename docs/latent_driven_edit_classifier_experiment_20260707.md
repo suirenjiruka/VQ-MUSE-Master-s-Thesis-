@@ -358,3 +358,131 @@ The implementation matches the intended experiment:
 4. old residual-logit bias is disabled by delta_alpha = 0.0
 5. high-mask experiment is not carried into this run
 ```
+
+## Result Update
+
+Status:
+
+```text
+not adopted as the next main path.
+```
+
+Observed behavior:
+
+```text
+The latent-driven final logit mix reached the old performance region quickly,
+but did not clearly break the 0.40 - 0.43 edit bottleneck.
+```
+
+Interpretation:
+
+```text
+It was not a catastrophic degradation,
+but it did not provide a reliable new decision signal.
+The latent logits tended to converge toward the same source/text/motion-prior basin as raw logits.
+```
+
+Decision:
+
+```text
+Disable use_latent_classifier.
+Keep VQ delta hidden/control and latent losses.
+Move to CFG residual text training.
+```
+
+Next record:
+
+```text
+docs/cfg_residual_text_training_experiment_20260707.md
+```
+
+## Next Direction
+
+The next change should not add capacity for its own sake.
+
+Two points should be tested together or in close sequence:
+
+```text
+1. time-aware scale refinement loss
+2. stronger hidden -> pred_delta_z supervision
+```
+
+Scale refinement:
+
+```text
+target/source ids are flattened by RVQ scale order:
+
+[scale-8 | scale-4 | scale-2 | scale-1]
+
+Use lvl_1L to apply scale-aware CE weights.
+Early/high-mask steps emphasize coarse scales.
+Late/low-mask steps emphasize fine/detail scales.
+```
+
+Delta supervision:
+
+```text
+delta_head is not only an extra head.
+Its job is to force the edit hidden state to learn:
+
+hidden -> pred_delta_z
+
+where:
+  gt_delta_z = z_tgt - z_src
+  pred_target_z = z_src + pred_delta_z
+  latent_logits = cosine(pred_target_z, codebook) / tau
+```
+
+Important rule:
+
+```text
+This must affect inference through latent_logits.
+If it is only an auxiliary loss, it repeats the old failed pattern.
+```
+
+Detailed idea record:
+
+```text
+docs/next_edit_instruction_experiments_20260707.md
+```
+
+## Scale-Aware Loss Update
+
+Status:
+
+```text
+implemented.
+```
+
+Config:
+
+```yaml
+model:
+  sc_loss: True
+  sc_w_early: [1.2, 1.1, 1.0, 0.9]
+  sc_w_late: [0.8, 1.0, 1.2, 1.4]
+```
+
+Meaning:
+
+```text
+weights follow cfg.vq.scales order.
+For [8, 4, 2, 1]:
+  early/high-mask training emphasizes coarse tokens.
+  late/low-mask training emphasizes fine/detail tokens.
+```
+
+Applied to:
+
+```text
+1. final CE
+2. latent CE
+```
+
+Generation samples:
+
+```text
+weight = 1.0
+```
+
+So this update targets editing refinement without changing the generation CE path.

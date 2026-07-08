@@ -357,6 +357,148 @@ drop it and do not repeat source-canvas variants.
 
 ## Other Candidate Ideas
 
+### Idea H: Time-Aware Scale Refinement Loss
+
+Status:
+
+```text
+next candidate.
+```
+
+Reason:
+
+```text
+The current latent-driven classifier can move output away from source,
+but the edit often stays partial or misses fine motion details.
+Since the VQ tokens are flattened by RVQ scale order,
+late denoising steps should care more about fine-scale token accuracy.
+```
+
+Tensor rule:
+
+```text
+Do not reshape by frame/joint.
+Use lvl_1L / patch_sizes because target ids are concatenated by scale:
+
+[scale-8 tokens | scale-4 tokens | scale-2 tokens | scale-1 tokens]
+```
+
+Sketch:
+
+```text
+progress = 1 - mask_ratio
+
+early scale weights:
+  emphasize coarse scales
+
+late scale weights:
+  emphasize fine/detail scales
+```
+
+Apply to:
+
+```text
+1. final CE on token logits
+2. latent CE on latent_logits
+```
+
+Do not change inference first.
+
+Purpose:
+
+```text
+make late refinement learn correct fine-scale VQ tokens,
+instead of only changing the latent/raw logit mixture.
+```
+
+Expected good sign:
+
+```text
+visual edit becomes less incomplete,
+fine motion amplitude improves,
+edit R@1 improves without hurting generation.
+```
+
+Risk:
+
+```text
+If scale order is wrong, the loss will train the wrong token levels.
+Must verify lvl_1L mapping before implementation.
+```
+
+### Idea I: Delta Head Supervision As Main Hidden-To-Latent Training
+
+Status:
+
+```text
+next candidate, paired with Idea H if latent-driven classifier remains stable.
+```
+
+Clarification:
+
+```text
+delta_head / delta supervision is not added just for more capacity.
+The purpose is to force the edit hidden state to learn:
+
+hidden -> pred_delta_z
+```
+
+Current motivation:
+
+```text
+The latent classifier is useful only if the hidden state contains a real edit delta.
+If delta_head only receives weak or source-dominated hidden features,
+latent_logits becomes another source-biased classifier.
+```
+
+Training target:
+
+```text
+z_src = VQ codebook[source_id]
+z_tgt = VQ codebook[target_id]
+gt_delta_z = z_tgt - z_src
+
+delta_head(hidden) -> pred_delta_z
+pred_target_z = z_src + pred_delta_z
+latent_logits = cosine(pred_target_z, codebook) / tau
+```
+
+Loss role:
+
+```text
+CE(latent_logits, target_id):
+  makes pred_target_z choose the correct target code.
+
+SmoothL1(pred_delta_z, gt_delta_z):
+  makes hidden represent source-to-target movement in VQ latent space.
+
+rank(pred_target_z closer to z_tgt than z_src):
+  prevents the latent path from collapsing back to source.
+```
+
+Design rule:
+
+```text
+Do not treat this as a generic auxiliary loss.
+It must feed the inference logits through latent_logits,
+otherwise it repeats old failed auxiliary-only designs.
+```
+
+Expected good sign:
+
+```text
+latent CE decreases together with edit R@1,
+and visualization shows stronger correct instruction movement.
+```
+
+Bad sign:
+
+```text
+latent CE decreases but edit R@1 stays flat.
+Then the VQ latent delta is learning code statistics,
+not useful edit semantics.
+```
+
 ### Idea E: Text-Conditioned Output Classifier
 
 Status:
@@ -481,19 +623,25 @@ Does it improve changed-token gradients without damaging generation?
 Current priority:
 
 ```text
-1. Plan C: Text Gain + Edit Effect Calibration
+1. Idea H: Time-Aware Scale Refinement Loss
+   clean next step for the current latent-driven classifier.
+
+2. Idea I: Delta Head Supervision As Main Hidden-To-Latent Training
+   keep only if latent_logits is actually used in inference.
+
+3. Plan C: Text Gain + Edit Effect Calibration
    already active; tests whether existing text path is enough if supervised better.
 
-2. Idea F: Changed-Token Focused Training
+4. Idea F: Changed-Token Focused Training
    cleanest next step; attacks CE dilution without changing inference or input distribution.
 
-3. Idea E: Text-Conditioned Output Classifier
+5. Idea E: Text-Conditioned Output Classifier
    strongest architectural next step; changes the main token decision surface.
 
-4. Plan D: Narrow Edit-Specific Source-To-Target Corruption
+6. Plan D: Narrow Edit-Specific Source-To-Target Corruption
    plausible but risky; old broad source canvas failed, so only try if done narrowly.
 
-5. Idea G: Source Branch Capacity Control
+7. Idea G: Source Branch Capacity Control
    useful as a stabilizer or ablation, not a standalone breakthrough.
 ```
 
