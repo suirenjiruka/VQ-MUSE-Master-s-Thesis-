@@ -78,7 +78,7 @@ model:
 
 training:
   batch_size: 64
-  max_epoch: 250
+  max_epoch: 130
   cond_drop_prob: 0.1
   weight_decay: 0.0
   pert_prob: 0.1
@@ -97,6 +97,34 @@ training:
   v_drop: 0.1  # source CFG drop
   t_drop: 0.1  # text CFG drop
   s_drop: 0.0  # source token drop
+  curriculum:
+    enabled: True
+    stages:
+      - name: text_alignment_soft
+        end_epoch: 30
+        edit_sample_ratio: 0.20
+        m_drop: 0.1
+        v_drop: 0.2
+        t_drop: 0.1
+        s_drop: 0.0
+        delta_beta: 0.15
+        weight_delta: 0.15
+        weight_latent: 0.01
+        weight_rank: 0.01
+      - name: edit_grounding
+        end_epoch: 130
+        reset_optimizer: True
+        lr: 1.0e-4
+        warm_up_iter: 1000
+        edit_sample_ratio: 0.35
+        m_drop: 0.1
+        v_drop: 0.1
+        t_drop: 0.1
+        s_drop: 0.0
+        delta_beta: 0.3
+        weight_delta: 0.5
+        weight_latent: 0.05
+        weight_rank: 0.05
 
 loss:
   weight_transformer_loss: 1.0

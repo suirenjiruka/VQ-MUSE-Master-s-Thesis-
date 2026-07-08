@@ -2,7 +2,7 @@ import os, argparse, shutil
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 import torch
 import numpy as np
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Sampler
 from os.path import join as pjoin
 from configs.load_config import load_config
 from SnapMogen_model.vq.rvq_model import HRVQVAE
@@ -13,6 +13,52 @@ from utils.get_opt import get_opt
 
 DATASET_HML3D     = 'hml3d'
 DATASET_SNAPMOGEN = 'snapmogen'
+
+
+class TaskRatioSampler(Sampler):
+    def __init__(self, is_edit, num_samples, edit_ratio=0.5, replacement=True):
+        self.is_edit = np.asarray(is_edit, dtype=np.int64)
+        self.num_samples = int(num_samples)
+        self.replacement = bool(replacement)
+        self.n_edit = int(self.is_edit.sum())
+        self.n_gen = int(len(self.is_edit) - self.n_edit)
+        self.set_edit_ratio(edit_ratio)
+
+    def set_edit_ratio(self, edit_ratio):
+        self.edit_ratio = float(min(max(edit_ratio, 0.0), 1.0))
+
+    def __iter__(self):
+        if self.n_edit > 0 and self.n_gen > 0:
+            weights = np.where(
+                self.is_edit == 1,
+                self.edit_ratio / self.n_edit,
+                (1.0 - self.edit_ratio) / self.n_gen,
+            )
+        else:
+            weights = np.ones_like(self.is_edit, dtype=np.float64) / max(len(self.is_edit), 1)
+        indices = torch.multinomial(
+            torch.from_numpy(weights).double(),
+            self.num_samples,
+            replacement=self.replacement,
+        )
+        return iter(indices.tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
+def copy_runtime_training_overrides(saved_cfg, runtime_cfg):
+    if hasattr(runtime_cfg.training, "curriculum"):
+        saved_cfg.training.curriculum = runtime_cfg.training.curriculum
+    for key in ("max_epoch", "edit_sample_ratio", "m_drop", "v_drop", "t_drop", "s_drop"):
+        if key in runtime_cfg.training:
+            saved_cfg.training[key] = runtime_cfg.training[key]
+    for key in ("weight_delta", "weight_latent", "weight_rank", "weight_same_src"):
+        if key in runtime_cfg.loss:
+            saved_cfg.loss[key] = runtime_cfg.loss[key]
+    if "delta_beta" in runtime_cfg.model:
+        saved_cfg.model.delta_beta = runtime_cfg.model.delta_beta
+    return saved_cfg
 
 
 def build_task_split(split_file, out_file, task_type, motionfix_start_id=400000):
@@ -116,6 +162,7 @@ if __name__ == '__main__':
 
     if cfg.exp.is_continue:
         n_cfg = load_config(pjoin(cfg.exp.checkpoint_dir, os.path.basename(args.config)))
+        n_cfg = copy_runtime_training_overrides(n_cfg, cfg)
         vq_cfg_path = pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name)
         n_cfg.exp.is_continue = True
         n_cfg.exp.device = cfg.exp.device
@@ -220,8 +267,7 @@ if __name__ == '__main__':
         edit_ratio = float(getattr(cfg.training, "edit_sample_ratio", 0.5))
         edit_ratio = min(max(edit_ratio, 0.0), 1.0)
         print(f"task sample ratio: gen {1.0 - edit_ratio:.2f}, edit {edit_ratio:.2f}")
-        sample_weights = np.where(is_edit == 1, edit_ratio / n_edit, (1.0 - edit_ratio) / n_gen)
-        train_sampler = WeightedRandomSampler(torch.from_numpy(sample_weights).double(), num_samples=len(is_edit), replacement=True)
+        train_sampler = TaskRatioSampler(is_edit, num_samples=len(is_edit), edit_ratio=edit_ratio, replacement=True)
         train_loader = DataLoader(train_dataset, batch_size=cfg.training.batch_size, drop_last=True, num_workers=8, sampler=train_sampler, pin_memory=True, collate_fn=loader_collate_fn)
     else:
         train_loader = DataLoader(train_dataset, batch_size=cfg.training.batch_size, drop_last=True, num_workers=8, shuffle=True, pin_memory=True, collate_fn=loader_collate_fn)

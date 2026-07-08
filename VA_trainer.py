@@ -83,8 +83,88 @@ class VA_motion_trainer:
         self.ema_decay = float(getattr(cfg.training, "ema_decay", 0.0))
         self.use_ema = 0.0 < self.ema_decay < 1.0
         self.ema = None
+        self.active_curriculum_stage = None
         # setup logger
         self.logger = SummaryWriter(cfg.exp.log_dir)
+
+    def _loss_weights(self):
+        return (
+            self.config.loss.weight_transformer_loss,
+            self.config.loss.weight_motion_text_InfoNCE,
+            getattr(self.config.loss, "weight_delta", 0.0),
+            getattr(self.config.loss, "weight_latent", 0.0),
+            getattr(self.config.loss, "weight_rank", 0.0),
+            getattr(self.config.loss, "weight_same_src", 0.0),
+        )
+
+    def _reset_optimizer_scheduler(self, lr, total_steps, warmup_steps=None):
+        lr = float(lr)
+        weight_decay = float(self.config.training.weight_decay)
+        params = [p for p in self.training_model.parameters() if p.requires_grad]
+        self.optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        warmup = self.config.training.warm_up_iter if warmup_steps is None else warmup_steps
+        warmup = min(int(warmup), max(int(total_steps) - 1, 0))
+        self.lr_scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup,
+            num_training_steps=max(int(total_steps), 1),
+        )
+
+    def _curriculum_stage_for_epoch(self, epoch):
+        curriculum = getattr(self.config.training, "curriculum", None)
+        if not curriculum or not curriculum.get("enabled", False):
+            return None
+        for stage in curriculum.get("stages", []):
+            if epoch < int(stage.get("end_epoch", self.config.training.max_epoch)):
+                return stage
+        stages = curriculum.get("stages", [])
+        return stages[-1] if stages else None
+
+    def _apply_curriculum_stage(self, epoch, train_loader, steps_per_epoch):
+        stage = self._curriculum_stage_for_epoch(epoch)
+        if stage is None:
+            return
+
+        stage_name = stage.get("name", f"stage_{epoch}")
+        changed = stage_name != self.active_curriculum_stage
+        if changed:
+            print(f"curriculum stage -> {stage_name} (epoch {epoch}, end_epoch {stage.get('end_epoch', 'max')})")
+
+        if changed and self.active_curriculum_stage is not None and stage.get("reset_optimizer", False):
+            remaining_steps = max(1, (self.config.training.max_epoch - epoch) * steps_per_epoch)
+            self._reset_optimizer_scheduler(
+                lr=stage.get("lr", self.config.training.lr),
+                total_steps=remaining_steps,
+                warmup_steps=stage.get("warm_up_iter", self.config.training.warm_up_iter),
+            )
+            print(f"reset optimizer/scheduler for {stage_name}: lr={stage.get('lr', self.config.training.lr)}, steps={remaining_steps}")
+
+        sampler = getattr(train_loader, "sampler", None)
+        if "edit_sample_ratio" in stage and hasattr(sampler, "set_edit_ratio"):
+            sampler.set_edit_ratio(stage["edit_sample_ratio"])
+            if changed:
+                print(f"task sample ratio: gen {1.0 - sampler.edit_ratio:.2f}, edit {sampler.edit_ratio:.2f}")
+
+        for key, attr in (
+            ("m_drop", "motion_drop_prob"),
+            ("t_drop", "text_drop_prob"),
+            ("v_drop", "source_drop_prob"),
+            ("s_drop", "source_token_drop_prob"),
+        ):
+            if key in stage:
+                setattr(self.config.training, key, float(stage[key]))
+                setattr(self.training_model, attr, float(stage[key]))
+
+        if "delta_beta" in stage:
+            self.config.model.delta_beta = float(stage["delta_beta"])
+            if hasattr(self.training_model, "delta_beta"):
+                self.training_model.delta_beta = float(stage["delta_beta"])
+
+        for key in ("weight_delta", "weight_latent", "weight_rank", "weight_same_src"):
+            if key in stage:
+                setattr(self.config.loss, key, float(stage[key]))
+
+        self.active_curriculum_stage = stage_name
 
     def forward(self, data_batch):
         # data fetch
@@ -203,12 +283,7 @@ class VA_motion_trainer:
         print(f"training epoch: {self.config.training.max_epoch}, {len(train_loader)} iterations in each epoch.")
         print(f"total training iteration: {total_iter}.") 
         # loss weight setup
-        w_trans = self.config.loss.weight_transformer_loss
-        w_mtext  = self.config.loss.weight_motion_text_InfoNCE
-        w_delta = getattr(self.config.loss, "weight_delta", 0.0)
-        w_latent = getattr(self.config.loss, "weight_latent", 0.0)
-        w_rank = getattr(self.config.loss, "weight_rank", 0.0)
-        w_same = getattr(self.config.loss, "weight_same_src", 0.0)
+        w_trans, w_mtext, w_delta, w_latent, w_rank, w_same = self._loss_weights()
 
         # tensorboard log format initialiozation
         logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
@@ -223,6 +298,8 @@ class VA_motion_trainer:
 
         #setup iterative epoch
         while epoch < max_epoch:
+            self._apply_curriculum_stage(epoch, train_loader, len(train_loader))
+            w_trans, w_mtext, w_delta, w_latent, w_rank, w_same = self._loss_weights()
             self.training_model.train()
             start.record()
 
