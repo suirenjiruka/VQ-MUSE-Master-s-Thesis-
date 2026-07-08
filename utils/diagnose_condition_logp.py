@@ -286,11 +286,30 @@ def diagnose_batch(cfg, trans, vq_model, batch, device):
     }
 
 
+def print_logp_summary(records):
+    def cat(key):
+        return torch.cat([r[key] for r in records], dim=0)
+
+    all_correct, all_null, all_shuffle = cat("all_correct"), cat("all_null"), cat("all_shuffle")
+    edit_correct, edit_null, edit_shuffle = cat("edit_correct"), cat("edit_null"), cat("edit_shuffle")
+
+    print("\nAll-token target logp")
+    print(f"  correct/null/shuffle: {all_correct.mean():.4f} / {all_null.mean():.4f} / {all_shuffle.mean():.4f}")
+    print(f"  correct-null: {(all_correct - all_null).mean():.4f}")
+    print(f"  correct-shuffle: {(all_correct - all_shuffle).mean():.4f}")
+
+    print("\nEdit-weighted target logp")
+    print(f"  correct/null/shuffle: {edit_correct.mean():.4f} / {edit_null.mean():.4f} / {edit_shuffle.mean():.4f}")
+    print(f"  correct-null: {(edit_correct - edit_null).mean():.4f}")
+    print(f"  correct-shuffle: {(edit_correct - edit_shuffle).mean():.4f}")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="./configs/train_vamotion_hml.yaml")
     parser.add_argument("--ckpt", type=str, default="/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/humanml3d/VA_motion/model/test/best.tar")
     parser.add_argument("--split", type=str, default="test")
+    parser.add_argument("--mode", choices=["logp", "rollout", "both"], default="logp",
+                        help="Compatibility only; this diagnostic always runs text/null/shuffle logp.")
     parser.add_argument("--num_samples", type=int, default=128)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=10306)
@@ -317,6 +336,8 @@ def main():
     indices = select_indices(dataset, "edit", 0, args.num_samples, random_select=True, seed=args.seed)
     random.shuffle(indices)
     print(f"samples selected: {len(indices)}, batch_size: {args.batch_size}")
+    if args.mode != "logp":
+        print(f"mode '{args.mode}' is ignored; running text/null/shuffle logp diagnostic.")
 
     records = []
     for start in range(0, len(indices), args.batch_size):
@@ -331,22 +352,7 @@ def main():
 
     if not records:
         raise RuntimeError("No edit samples were diagnosed.")
-
-    def cat(key):
-        return torch.cat([r[key] for r in records], dim=0)
-
-    all_correct, all_null, all_shuffle = cat("all_correct"), cat("all_null"), cat("all_shuffle")
-    edit_correct, edit_null, edit_shuffle = cat("edit_correct"), cat("edit_null"), cat("edit_shuffle")
-
-    print("\nAll-token target logp")
-    print(f"  correct/null/shuffle: {all_correct.mean():.4f} / {all_null.mean():.4f} / {all_shuffle.mean():.4f}")
-    print(f"  correct-null: {(all_correct - all_null).mean():.4f}")
-    print(f"  correct-shuffle: {(all_correct - all_shuffle).mean():.4f}")
-
-    print("\nEdit-weighted target logp")
-    print(f"  correct/null/shuffle: {edit_correct.mean():.4f} / {edit_null.mean():.4f} / {edit_shuffle.mean():.4f}")
-    print(f"  correct-null: {(edit_correct - edit_null).mean():.4f}")
-    print(f"  correct-shuffle: {(edit_correct - edit_shuffle).mean():.4f}")
+    print_logp_summary(records)
 
 
 if __name__ == "__main__":

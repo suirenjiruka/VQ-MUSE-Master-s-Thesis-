@@ -57,21 +57,35 @@ def load_vq_model(trans_cfg, device):
     return vq_model.to(device).eval(), vq_cfg
 
 
-def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device):
+def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False):
     # Load current motion editing transformer; no video/joint condition is used
     trans_cfg.vq = vq_cfg.quantizer
     trans_cfg.vq.nb_code = vq_cfg.quantizer.nb_code
     trans = VAMotion(cfg=trans_cfg, device=device, full_length=trans_cfg.data.max_motion_length // trans_cfg.data.unit_length)
 
     model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'model')
-    ckpt_path = pjoin(model_dir, ckpt_name)
+    ckpt_path = ckpt_name if os.path.isabs(ckpt_name) else pjoin(model_dir, ckpt_name)
     trans_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    missing, unexpected = trans.load_state_dict(trans_ckpt['training_model'], strict=False)
+    state_dict = trans_ckpt['training_model']
+    if use_ema:
+        ema_state = trans_ckpt.get('ema', None)
+        if ema_state is not None and 'shadow' in ema_state:
+            state_dict = state_dict.copy()
+            ema_shadow = ema_state['shadow']
+            replaced = 0
+            for name, value in ema_shadow.items():
+                if name in state_dict:
+                    state_dict[name] = value
+                    replaced += 1
+            print(f'Using EMA weights from checkpoint: {replaced} tensors')
+        else:
+            print('EMA requested, but checkpoint has no EMA state; using raw training_model weights')
+    missing, unexpected = trans.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"missing keys from ckpt: {missing[:5]}")
     if unexpected:
         print(f"unexpected keys from ckpt: {unexpected[:5]}")
-    print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")})')
+    print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")}, use_ema={use_ema})')
     return trans.to(device).eval()
 
 
@@ -246,6 +260,10 @@ if __name__ == '__main__':
                         help='Eval config: time_steps, cond_scales, repeat_time, sampling params')
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Override checkpoint filename, default follows eval_cfg.which_ckpt')
+    parser.add_argument('--use_ema', action='store_true',
+                        help='Use EMA weights from checkpoint when available')
+    parser.add_argument('--no_ema', action='store_true',
+                        help='Force raw training_model weights even if eval_cfg.use_ema is true')
     parser.add_argument('--split', type=str, default=None,
                         help='Override eval_cfg.split, e.g. val or test')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -276,7 +294,12 @@ if __name__ == '__main__':
 
     vq_model, vq_cfg = load_vq_model(trans_cfg, device)
     ckpt_name = args.ckpt or eval_cfg.which_ckpt
-    trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device)
+    use_ema = bool(getattr(eval_cfg, 'use_ema', False))
+    if args.use_ema:
+        use_ema = True
+    if args.no_ema:
+        use_ema = False
+    trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=use_ema)
     if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
         trans.set_vq_codebook(vq_model.quantizer.codebook)
 
@@ -306,7 +329,8 @@ if __name__ == '__main__':
 
     log_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'eval')
     os.makedirs(log_dir, exist_ok=True)
-    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_name.replace(".tar", "")}.log'
+    ckpt_tag = ckpt_name.replace("\\", "/").replace("/", "_").replace(".tar", "")
+    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_tag}.log'
     out_path = pjoin(log_dir, log_name)
     f = open(out_path, 'w', encoding='utf-8')
     print(f'Logging to {out_path}')
@@ -316,53 +340,61 @@ if __name__ == '__main__':
     temp = getattr(eval_cfg, 'temperature', 1)
     source_cond_scale = getattr(eval_cfg, 'source_cond_scale', 1.0)
     base_seed = getattr(trans_cfg.exp, 'seed', 3407)
+    cond_scales = list(getattr(eval_cfg, 'cond_scales', [4]))
+    gen_cond_scales = list(getattr(eval_cfg, 'gen_cond_scales', cond_scales))
+    edit_cond_scales = list(getattr(eval_cfg, 'edit_cond_scales', cond_scales))
+    if not eval_generation:
+        gen_cond_scales = [None]
+    if not eval_editing:
+        edit_cond_scales = [None]
 
-    for cs in eval_cfg.cond_scales:
-        for ts in eval_cfg.time_steps:
-            gen_metrics_list, edit_metrics_list = [], []
+    for gen_cs in gen_cond_scales:
+        for edit_cs in edit_cond_scales:
+            for ts in eval_cfg.time_steps:
+                gen_metrics_list, edit_metrics_list = [], []
 
-            for i in range(eval_cfg.repeat_time):
-                fixseed(base_seed + i)
-                header = f'Guidance scale: {cs}, time step: {ts}, repeat: {i}'
-                print(header)
-                print(header, file=f, flush=True)
+                for i in range(eval_cfg.repeat_time):
+                    fixseed(base_seed + i)
+                    header = f'Gen scale: {gen_cs}, Edit scale: {edit_cs}, source scale: {source_cond_scale}, time step: {ts}, repeat: {i}'
+                    print(header)
+                    print(header, file=f, flush=True)
 
-                if gen_loader is not None:
-                    gen_metrics = evaluation_generation_hml(
-                        gen_loader, trans, vq_model, eval_wrapper, device,
-                        time_steps=ts, cond_scale=cs, unit_length=trans_cfg.data.unit_length,
-                        source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample
-                    )
-                    if gen_metrics is not None:
-                        gen_metrics_list.append(gen_metrics)
-                        print(format_generation(gen_metrics))
-                        print(format_generation(gen_metrics), file=f, flush=True)
+                    if gen_loader is not None:
+                        gen_metrics = evaluation_generation_hml(
+                            gen_loader, trans, vq_model, eval_wrapper, device,
+                            time_steps=ts, cond_scale=gen_cs, unit_length=trans_cfg.data.unit_length,
+                            source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample
+                        )
+                        if gen_metrics is not None:
+                            gen_metrics_list.append(gen_metrics)
+                            print(format_generation(gen_metrics))
+                            print(format_generation(gen_metrics), file=f, flush=True)
 
-                if edit_loader is not None:
-                    edit_metrics = evaluation_motion_editing_hml(
-                        edit_loader, trans, vq_model, writer=None, ep=i, eval_wrapper=edit_eval_wrapper, device=device,
-                        time_steps=ts, cond_scale=cs, unit_length=trans_cfg.data.unit_length,
-                        source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample, draw=False
-                    )
-                    if edit_metrics is not None:
-                        edit_metrics_list.append(edit_metrics)
-                        print(format_editing(edit_metrics))
-                        print(format_editing(edit_metrics), file=f, flush=True)
+                    if edit_loader is not None:
+                        edit_metrics = evaluation_motion_editing_hml(
+                            edit_loader, trans, vq_model, writer=None, ep=i, eval_wrapper=edit_eval_wrapper, device=device,
+                            time_steps=ts, cond_scale=edit_cs, unit_length=trans_cfg.data.unit_length,
+                            source_cond_scale=source_cond_scale, temperature=temp, topk_filter_thres=topkr, gsample=gsample, draw=False
+                        )
+                        if edit_metrics is not None:
+                            edit_metrics_list.append(edit_metrics)
+                            print(format_editing(edit_metrics))
+                            print(format_editing(edit_metrics), file=f, flush=True)
 
-            summary_head = f'=== Final Result  cs={cs}  source_scale={source_cond_scale}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
-            print(summary_head)
-            print(summary_head, file=f, flush=True)
+                summary_head = f'=== Final Result  gen_cs={gen_cs}  edit_cs={edit_cs}  source_scale={source_cond_scale}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
+                print(summary_head)
+                print(summary_head, file=f, flush=True)
 
-            write_summary('--- Generation ---', gen_metrics_list, [
-                ('R@1', 'r1', 4), ('R@2', 'r2', 4), ('R@3', 'r3', 4),
-                ('Matching', 'matching', 4), ('FID', 'fid', 4), ('Diversity', 'diversity', 4), ('AITS', 'aits', 4),
-            ], f)
+                write_summary('--- Generation ---', gen_metrics_list, [
+                    ('R@1', 'r1', 4), ('R@2', 'r2', 4), ('R@3', 'r3', 4),
+                    ('Matching', 'matching', 4), ('FID', 'fid', 4), ('Diversity', 'diversity', 4), ('AITS', 'aits', 4),
+                ], f)
 
-            write_summary('--- Editing ---', edit_metrics_list, [
-                ('G2T R@1', 'g2t_r1', 4), ('G2T R@2', 'g2t_r2', 4), ('G2T R@3', 'g2t_r3', 4), ('G2T AvgR', 'g2t_avgr', 2),
-                ('G2S R@1', 'g2s_r1', 4), ('G2S R@2', 'g2s_r2', 4), ('G2S R@3', 'g2s_r3', 4), ('G2S AvgR', 'g2s_avgr', 2),
-                ('TMR-FID', 'fid', 4), ('TMR-Diversity', 'diversity', 4), ('AITS', 'aits', 4),
-            ], f)
+                write_summary('--- Editing ---', edit_metrics_list, [
+                    ('G2T R@1', 'g2t_r1', 4), ('G2T R@2', 'g2t_r2', 4), ('G2T R@3', 'g2t_r3', 4), ('G2T AvgR', 'g2t_avgr', 2),
+                    ('G2S R@1', 'g2s_r1', 4), ('G2S R@2', 'g2s_r2', 4), ('G2S R@3', 'g2s_r3', 4), ('G2S AvgR', 'g2s_avgr', 2),
+                    ('TMR-FID', 'fid', 4), ('TMR-Diversity', 'diversity', 4), ('AITS', 'aits', 4),
+                ], f)
 
     f.close()
     print('Done.')
