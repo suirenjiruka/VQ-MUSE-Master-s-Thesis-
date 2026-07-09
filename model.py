@@ -215,6 +215,9 @@ class VAMotion(nn.Module):
         self.same_src_max = int(getattr(cfg.loss, "same_src_max", 16))
         self.use_same_src_loss = float(getattr(cfg.loss, "weight_same_src", 0.0)) > 0.0
         self.eval_same_src_metric = bool(getattr(cfg.loss, "eval_same_src_metric", True))
+        self.null_gain_margin = float(getattr(cfg.loss, "null_gain_margin", 0.05))
+        self.null_gain_topk = float(getattr(cfg.loss, "null_gain_topk", 0.30))
+        self.null_gain_temp = float(getattr(cfg.loss, "null_gain_temp", 0.5))
         self.output_process = OutputProcess_Bert(out_feats=cfg.vq.nb_code, latent_dim=self.latent_dim)
         self.register_buffer("vq_codebook", torch.empty(0), persistent=False)
 
@@ -537,6 +540,45 @@ class VAMotion(nn.Module):
         rank_loss = (rank_dist * weight).sum() / weight.sum().clamp(min=1.0)
         return delta_loss, latent_loss, rank_loss
 
+    def null_error_gain_loss(self, text_logits, null_logits, target_ids,
+                             target_mask, predict_mask, active_edit):
+        zero = text_logits.new_tensor(0.0)
+        if text_logits is None or null_logits is None:
+            return zero, zero
+
+        active = active_edit.view(-1, 1).bool()
+        valid = target_mask.bool() & predict_mask.bool() & active
+        valid = valid & (target_ids >= 0) & (target_ids < self.cfg.vq.nb_code)
+        if valid.sum() == 0:
+            return zero, zero
+
+        labels = torch.where(valid, target_ids, self.mask_id)
+        null_ce = F.cross_entropy(null_logits.detach(), labels, ignore_index=self.mask_id, reduction="none")
+        text_ce = F.cross_entropy(text_logits, labels, ignore_index=self.mask_id, reduction="none")
+
+        topk_frac = min(max(float(self.null_gain_topk), 0.0), 1.0)
+        if topk_frac < 1.0:
+            valid_count = valid.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+            keep_count = torch.ceil(valid_count * topk_frac).long().clamp(min=1)
+            score = null_ce.masked_fill(~valid, -1e4)
+            rank = score.argsort(dim=1, descending=True).argsort(dim=1)
+            weight_mask = valid & (rank < keep_count)
+        else:
+            weight_mask = valid
+
+        weighted_score = (null_ce / max(float(self.null_gain_temp), 1e-6)).masked_fill(~weight_mask, -1e4)
+        weights = torch.softmax(weighted_score, dim=1) * weight_mask.float()
+        weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1e-6)
+
+        gain = ((null_ce - text_ce) * weights).sum(dim=1)
+        keep = weight_mask.any(dim=1)
+        if keep.sum() == 0:
+            return zero, zero
+
+        gain = gain[keep]
+        loss = F.softplus(self.null_gain_margin - gain).mean()
+        return loss, gain.mean()
+
     def InfoNCE_text(self, motion, text_input, m_mask, t_mask, temperature=0.15):
         m_weight = self.motion_mlp(motion) # [B, L, D] -> [B, L, 1]
         t_weight = self.text_mlp(text_input)
@@ -699,6 +741,31 @@ class VAMotion(nn.Module):
             latent_logits, delta_pred, target_ids, aligned_src_ids,
             target_mask, predict_mask, active_edit
         )
+        null_gain_loss = raw_logits.new_tensor(0.0)
+        null_gain_gap = raw_logits.new_tensor(0.0)
+        use_null_gain = float(getattr(self.cfg.loss, "weight_null_gain", 0.0)) > 0.0
+        use_null_gain = use_null_gain or ((not self.training) and bool(getattr(self.cfg.loss, "eval_null_gain_metric", True)))
+        if use_null_gain and active_edit.any():
+            with torch.no_grad():
+                null_text = self.null_text_embed.expand_as(text_tokens)
+                null_text_cross = self.text_cross(masked_motion_tokens, null_text, text_mask)
+                null_source_cross = self.source_cross(null_text_cross, source_tokens, source_mask)
+                null_source_cross = torch.where(source_present, null_source_cross, null_text_cross)
+                null_transformer_input = masked_motion_tokens + null_source_cross
+                null_control_residuals = self.control_encoder(
+                    null_transformer_input, aligned_src, cond=null_text_cross, padding_mask=~target_mask
+                )
+                null_output = self.adaln_encoder(
+                    x=null_transformer_input,
+                    cond=null_text_cross,
+                    padding_mask=~target_mask,
+                    control_residuals=null_control_residuals,
+                    control_gate=source_present.float()
+                )
+                null_logits = self.output_process(null_output)
+            null_gain_loss, null_gain_gap = self.null_error_gain_loss(
+                logits, null_logits, target_ids, target_mask, predict_mask, active_edit
+            )
         same_loss, same_gap = self.same_source_text_loss(
             text_tokens_for_loss, text_mask, source_tokens, source_mask,
             aligned_src, aligned_src_ids, target_ids, target_mask, time_to_arrival_pe,
@@ -708,7 +775,7 @@ class VAMotion(nn.Module):
         #Info_NCE loss computation
         loss_mt = self.InfoNCE_text(target_tokens, text_tokens_for_loss, target_mask, text_mask, temperature=0.15)
 
-        return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, same_loss, same_gap, acc
+        return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, acc
     
     def forward_with_cond_scale(self, motion_ids, source_ids, text_embs, time_to_arrival_pe, source_pe,
                                 source_mask, text_mask, motion_padding_mask, has_source, mask_ratio,

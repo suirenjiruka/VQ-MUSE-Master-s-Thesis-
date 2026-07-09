@@ -53,7 +53,10 @@ def copy_runtime_training_overrides(saved_cfg, runtime_cfg):
     for key in ("max_epoch", "edit_sample_ratio", "m_drop", "v_drop", "t_drop", "s_drop", "mask_lo", "mask_hi", "mask_schedule"):
         if key in runtime_cfg.training:
             saved_cfg.training[key] = runtime_cfg.training[key]
-    for key in ("weight_delta", "weight_latent", "weight_rank", "weight_same_src"):
+    for key in (
+        "weight_delta", "weight_latent", "weight_rank", "weight_null_gain", "weight_same_src",
+        "null_gain_margin", "null_gain_topk", "null_gain_temp", "eval_null_gain_metric",
+    ):
         if key in runtime_cfg.loss:
             saved_cfg.loss[key] = runtime_cfg.loss[key]
     if "delta_beta" in runtime_cfg.model:
@@ -239,7 +242,7 @@ if __name__ == '__main__':
     print(f"stage: {args.stage}, trainable parameter: {n_trainable / 1000} k")
 
     trainer = VA_motion_trainer(cfg, vq_model=vq_model, va_transformer=TV2m_transformer, eval_wrapper=eval_wrapper,
-                                edit_eval_wrapper=edit_eval_wrapper, device=device)
+                                edit_eval_wrapper=edit_eval_wrapper, device=device, resume_ckpt=args.OnGoing_model)
 
     if args.dataset == DATASET_HML3D:
         from dataset.HumanML3D_dataset import HML3DMotionEditDataset, Text2MotionDatasetEval, collate_fn

@@ -117,6 +117,7 @@ training:
         weight_delta: 0.15
         weight_latent: 0.01
         weight_rank: 0.01
+        weight_null_gain: 0.0
       - name: edit_grounding
         end_epoch: 130
         reset_optimizer: True
@@ -129,11 +130,12 @@ training:
         m_drop: 0.1
         v_drop: 0.1
         t_drop: 0.1
-        s_drop: 0.0
+        s_drop: 0.08
         delta_beta: 0.3
         weight_delta: 0.5
         weight_latent: 0.05
         weight_rank: 0.05
+        weight_null_gain: 0.5
 
 loss:
   weight_transformer_loss: 1.0
@@ -141,7 +143,12 @@ loss:
   weight_delta: 0.5
   weight_latent: 0.05
   weight_rank: 0.05
+  weight_null_gain: 0.0
   delta_rank_margin: 0.2
+  null_gain_margin: 0.05
+  null_gain_topk: 0.30
+  null_gain_temp: 0.5
+  eval_null_gain_metric: True
   weight_same_src: 0.0
   eval_same_src_metric: True
   same_src_margin: 1.0

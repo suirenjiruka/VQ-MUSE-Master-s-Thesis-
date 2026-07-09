@@ -1,7 +1,7 @@
-import torch
 import math
-from tqdm import tqdm
+import os
 import torch
+from tqdm import tqdm
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter 
 from os.path import join as pjoin
@@ -66,7 +66,7 @@ class ModelEMA:
 
 
 class VA_motion_trainer:
-    def __init__(self, cfg, vq_model, va_transformer, eval_wrapper, device, edit_eval_wrapper=None):
+    def __init__(self, cfg, vq_model, va_transformer, eval_wrapper, device, edit_eval_wrapper=None, resume_ckpt=None):
         #config setup
         self.config = cfg
         self.vq_model = vq_model
@@ -79,13 +79,30 @@ class VA_motion_trainer:
         lr = float(cfg.training.lr)
         weight_decay = float(cfg.training.weight_decay)
         # frozen branches (two-stage plan) stay out of the optimizer; also keeps optimizer state resume-compatible
-        self.optimizer = optim.AdamW([p for p in self.training_model.parameters() if p.requires_grad], lr=lr, weight_decay=weight_decay)
+        self.optimizer = optim.AdamW(self._optimizer_param_groups(lr, weight_decay))
         self.ema_decay = float(getattr(cfg.training, "ema_decay", 0.0))
         self.use_ema = 0.0 < self.ema_decay < 1.0
         self.ema = None
         self.active_curriculum_stage = None
+        self.resume_ckpt = resume_ckpt
         # setup logger
         self.logger = SummaryWriter(cfg.exp.log_dir)
+
+    def _optimizer_param_groups(self, lr, weight_decay):
+        decay = []
+        no_decay = []
+        for name, param in self.training_model.named_parameters():
+            if not param.requires_grad:
+                continue
+            lname = name.lower()
+            if param.ndim < 2 or "norm" in lname or "embed" in lname or "embedding" in lname:
+                no_decay.append(param)
+            else:
+                decay.append(param)
+        return [
+            {"params": decay, "lr": lr, "weight_decay": weight_decay},
+            {"params": no_decay, "lr": lr, "weight_decay": 0.0},
+        ]
 
     def _loss_weights(self):
         return (
@@ -94,14 +111,14 @@ class VA_motion_trainer:
             getattr(self.config.loss, "weight_delta", 0.0),
             getattr(self.config.loss, "weight_latent", 0.0),
             getattr(self.config.loss, "weight_rank", 0.0),
+            getattr(self.config.loss, "weight_null_gain", 0.0),
             getattr(self.config.loss, "weight_same_src", 0.0),
         )
 
     def _reset_optimizer_scheduler(self, lr, total_steps, warmup_steps=None):
         lr = float(lr)
         weight_decay = float(self.config.training.weight_decay)
-        params = [p for p in self.training_model.parameters() if p.requires_grad]
-        self.optimizer = optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        self.optimizer = optim.AdamW(self._optimizer_param_groups(lr, weight_decay))
         warmup = self.config.training.warm_up_iter if warmup_steps is None else warmup_steps
         warmup = min(int(warmup), max(int(total_steps) - 1, 0))
         self.lr_scheduler = get_cosine_schedule_with_warmup(
@@ -120,6 +137,15 @@ class VA_motion_trainer:
         stages = curriculum.get("stages", [])
         return stages[-1] if stages else None
 
+    def _curriculum_stage_start(self, target_stage):
+        curriculum = getattr(self.config.training, "curriculum", None)
+        start_epoch = 0
+        for stage in curriculum.get("stages", []):
+            if stage is target_stage:
+                return start_epoch
+            start_epoch = int(stage.get("end_epoch", self.config.training.max_epoch))
+        return 0
+
     def _apply_curriculum_stage(self, epoch, train_loader, steps_per_epoch):
         stage = self._curriculum_stage_for_epoch(epoch)
         if stage is None:
@@ -130,7 +156,9 @@ class VA_motion_trainer:
         if changed:
             print(f"curriculum stage -> {stage_name} (epoch {epoch}, end_epoch {stage.get('end_epoch', 'max')})")
 
-        if changed and self.active_curriculum_stage is not None and stage.get("reset_optimizer", False):
+        stage_start = self._curriculum_stage_start(stage)
+        direct_resume_entry = self.active_curriculum_stage is None and epoch == stage_start and epoch > 0
+        if changed and stage.get("reset_optimizer", False) and (self.active_curriculum_stage is not None or direct_resume_entry):
             remaining_steps = max(1, (self.config.training.max_epoch - epoch) * steps_per_epoch)
             self._reset_optimizer_scheduler(
                 lr=stage.get("lr", self.config.training.lr),
@@ -169,7 +197,7 @@ class VA_motion_trainer:
             if hasattr(self.training_model, "delta_beta"):
                 self.training_model.delta_beta = float(stage["delta_beta"])
 
-        for key in ("weight_delta", "weight_latent", "weight_rank", "weight_same_src"):
+        for key in ("weight_delta", "weight_latent", "weight_rank", "weight_null_gain", "weight_same_src"):
             if key in stage:
                 setattr(self.config.loss, key, float(stage[key]))
 
@@ -211,14 +239,14 @@ class VA_motion_trainer:
         #ensure all input device consistant
         caption = caption.to(self.device).float() if torch.is_tensor(caption) else caption
 
-        _loss, loss_mt, delta_loss, latent_loss, rank_loss, same_loss, same_gap, _acc = self.training_model(
+        _loss, loss_mt, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, _acc = self.training_model(
             target_code_idx, source_code_idx, caption, m_lens, has_source,
             source_m_lens=src_m_lens, source_joints=src_joints, target_joints=tgt_joints,
             same_src_text=same_src_text, same_src_flag=same_src_flag,
             same_target_input=same_target_code_idx, same_m_lens=same_m_lens
         )
 
-        return _loss, loss_mt, delta_loss, latent_loss, rank_loss, same_loss, same_gap, _acc
+        return _loss, loss_mt, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, _acc
     
     def save(self, save_pth, epoch: int):
         # save model
@@ -253,19 +281,29 @@ class VA_motion_trainer:
                                                             num_training_steps= max_epoch * len(train_loader))
         #repair if cfg.exp.is_continue = true
         if self.config.exp.is_continue == True:
-            model_dir = pjoin(self.config.exp.model_dir, 'latest.tar')  # we save latest everyy 1 epochs, and index_based checkpointt everyy 50 epochs
+            ckpt_name = self.resume_ckpt if self.resume_ckpt is not None else 'latest.tar'
+            model_dir = ckpt_name if os.path.isabs(ckpt_name) else pjoin(self.config.exp.model_dir, ckpt_name)
+            if not os.path.exists(model_dir) and not str(model_dir).endswith(".tar"):
+                model_dir = f"{model_dir}.tar"
+            print(f"resume checkpoint: {model_dir}")
             checkpoint = torch.load(model_dir, map_location=self.device, weights_only=True)
 
             _, unexpected_keys = self.training_model.load_state_dict(checkpoint['training_model'], strict=False)
             old_keys = ("text_delta_encoder.", "edit_map_head.", "latent_MLP.", "edit_delta_head.")
             unexpected_keys = [k for k in unexpected_keys if not k.startswith(old_keys)]
             assert len(unexpected_keys) == 0
+            optimizer_loaded = True
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer']) # Optimizer
             except ValueError:
                 print("optimizer state is incompatible with current trainable params; reset optimizer")
-            self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler']) # Scheduler
-            epoch = checkpoint['epoch']
+                optimizer_loaded = False
+            if optimizer_loaded:
+                self.lr_scheduler.load_state_dict(checkpoint['lr_scheduler']) # Scheduler
+            else:
+                print("scheduler state is reset with optimizer")
+            epoch = int(checkpoint['epoch']) + 1
+            print(f"resume from completed epoch {checkpoint['epoch']}; next epoch {epoch}")
             if self.use_ema:
                 self.ema = ModelEMA(self.training_model, self.ema_decay)
                 if 'ema' in checkpoint:
@@ -292,11 +330,12 @@ class VA_motion_trainer:
         print(f"training epoch: {self.config.training.max_epoch}, {len(train_loader)} iterations in each epoch.")
         print(f"total training iteration: {total_iter}.") 
         # loss weight setup
-        w_trans, w_mtext, w_delta, w_latent, w_rank, w_same = self._loss_weights()
+        w_trans, w_mtext, w_delta, w_latent, w_rank, w_null_gain, w_same = self._loss_weights()
 
         # tensorboard log format initialiozation
         logs = {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
                 "vq_delta": 0.0, "vq_latent": 0.0, "vq_rank": 0.0,
+                "null_gain": 0.0, "null_gap": 0.0,
                 "same_src": 0.0, "same_gap": 0.0, "accuracy": 0.0}
         log_period = self.config.training.log_every
 
@@ -308,7 +347,7 @@ class VA_motion_trainer:
         #setup iterative epoch
         while epoch < max_epoch:
             self._apply_curriculum_stage(epoch, train_loader, len(train_loader))
-            w_trans, w_mtext, w_delta, w_latent, w_rank, w_same = self._loss_weights()
+            w_trans, w_mtext, w_delta, w_latent, w_rank, w_null_gain, w_same = self._loss_weights()
             self.training_model.train()
             start.record()
 
@@ -316,9 +355,10 @@ class VA_motion_trainer:
             for i, batch in tqdm(enumerate(train_loader)):
                 current_iter += 1
                 # calculatte loss & optimization
-                transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, same_loss, same_gap, acc = self.forward(batch)
+                transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, acc = self.forward(batch)
                 loss = (w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
                         + w_delta * delta_loss + w_latent * latent_loss + w_rank * rank_loss
+                        + w_null_gain * null_gain_loss
                         + w_same * same_loss)
                 self.optimizer.zero_grad()
                 if math.isnan(loss.item()):
@@ -336,6 +376,8 @@ class VA_motion_trainer:
                 logs['vq_delta'] += delta_loss.item()
                 logs['vq_latent'] += latent_loss.item()
                 logs['vq_rank'] += rank_loss.item()
+                logs['null_gain'] += null_gain_loss.item()
+                logs['null_gap'] += null_gain_gap.item()
                 logs['same_src'] += same_loss.item()
                 logs['same_gap'] += same_gap.item()
                 logs['accuracy'] += acc
@@ -345,10 +387,11 @@ class VA_motion_trainer:
                     for key, value in logs.items():
                         self.logger.add_scalar(f"train/{key}", value / log_period, current_iter)
                     # print logs
-                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, vq_delta: {logs['vq_delta'] / log_period:.4f}, vq_latent: {logs['vq_latent'] / log_period:.4f}, vq_rank: {logs['vq_rank'] / log_period:.4f}, same_src: {logs['same_src'] / log_period:.4f}, same_gap: {logs['same_gap'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
+                    print(f"cuurent iter: {current_iter}. Avg total loss: {logs['total_loss'] / log_period:.4f}, transformer loss: {logs['transformer_loss'] / log_period:.4f}, InfoNCE_text: {logs['InfoNCE_text'] / log_period:.4f}, vq_delta: {logs['vq_delta'] / log_period:.4f}, vq_latent: {logs['vq_latent'] / log_period:.4f}, vq_rank: {logs['vq_rank'] / log_period:.4f}, null_gain: {logs['null_gain'] / log_period:.4f}, null_gap: {logs['null_gap'] / log_period:.4f}, same_src: {logs['same_src'] / log_period:.4f}, same_gap: {logs['same_gap'] / log_period:.4f}, accuracy: {logs['accuracy'] / log_period:.3f}")
                     # reset logs
                     logs =  {"total_loss": 0.0, "transformer_loss": 0.0, "InfoNCE_text": 0.0,
                              "vq_delta": 0.0, "vq_latent": 0.0, "vq_rank": 0.0,
+                             "null_gain": 0.0, "null_gap": 0.0,
                              "same_src": 0.0, "same_gap": 0.0, "accuracy": 0.0}
                     
                     
@@ -368,21 +411,26 @@ class VA_motion_trainer:
             val_delta = 0.0
             val_latent = 0.0
             val_rank = 0.0
+            val_null_gain = 0.0
+            val_null_gap = 0.0
             val_same = 0.0
             val_same_gap = 0.0
             val_num = len(val_loader)
 
             with torch.no_grad():
                 for i, batch in enumerate(val_loader):
-                    transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, same_loss, same_gap, acc = self.forward(batch)
+                    transformer_loss, InfoNCE_mt_loss, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, acc = self.forward(batch)
                     loss = (w_trans * transformer_loss + w_mtext * InfoNCE_mt_loss
                             + w_delta * delta_loss + w_latent * latent_loss + w_rank * rank_loss
+                            + w_null_gain * null_gain_loss
                             + w_same * same_loss)
                     val_loss += loss.item()
                     val_acc += acc
                     val_delta += delta_loss.item()
                     val_latent += latent_loss.item()
                     val_rank += rank_loss.item()
+                    val_null_gain += null_gain_loss.item()
+                    val_null_gap += null_gain_gap.item()
                     val_same += same_loss.item()
                     val_same_gap += same_gap.item()
                     # round to 3 decimals
@@ -391,15 +439,19 @@ class VA_motion_trainer:
                 val_delta = val_delta / val_num
                 val_latent = val_latent / val_num
                 val_rank = val_rank / val_num
+                val_null_gain = val_null_gain / val_num
+                val_null_gap = val_null_gap / val_num
                 val_same = val_same / val_num
                 val_same_gap = val_same_gap / val_num
-                print(f"validation result, loss: {val_loss:.3f}, vq_delta: {val_delta:.3f}, vq_latent: {val_latent:.3f}, vq_rank: {val_rank:.3f}, same_src: {val_same:.3f}, same_gap: {val_same_gap:.3f}, accuracy: {val_acc:.3f}")
+                print(f"validation result, loss: {val_loss:.3f}, vq_delta: {val_delta:.3f}, vq_latent: {val_latent:.3f}, vq_rank: {val_rank:.3f}, null_gain: {val_null_gain:.3f}, null_gap: {val_null_gap:.3f}, same_src: {val_same:.3f}, same_gap: {val_same_gap:.3f}, accuracy: {val_acc:.3f}")
 
                 self.logger.add_scalar('Val/loss', val_loss, epoch)
                 self.logger.add_scalar('Val/acc', val_acc, epoch)
                 self.logger.add_scalar('Val/vq_delta', val_delta, epoch)
                 self.logger.add_scalar('Val/vq_latent', val_latent, epoch)
                 self.logger.add_scalar('Val/vq_rank', val_rank, epoch)
+                self.logger.add_scalar('Val/null_gain', val_null_gain, epoch)
+                self.logger.add_scalar('Val/null_gap', val_null_gap, epoch)
                 self.logger.add_scalar('Val/same_src', val_same, epoch)
                 self.logger.add_scalar('Val/same_gap', val_same_gap, epoch)
             
