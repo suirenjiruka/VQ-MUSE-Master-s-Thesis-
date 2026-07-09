@@ -3,6 +3,7 @@ if os.name != "nt":
     os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 
 import argparse
+import copy
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -385,7 +386,8 @@ def add_body_mesh(scene, trimesh, pyrender, vertices, faces, color, vis_cfg=None
     else:
         solid_color.append(mesh_alpha)
     alpha_mode = 'BLEND' if mesh_alpha < 0.999 else 'OPAQUE'
-    material = pyrender.MetallicRoughnessMaterial(metallicFactor=0.0, roughnessFactor=0.42,
+    material = pyrender.MetallicRoughnessMaterial(metallicFactor=float(getattr(vis_cfg, "mesh_metallic", 0.0)),
+                                                  roughnessFactor=float(getattr(vis_cfg, "mesh_roughness", 0.58)),
                                                   alphaMode=alpha_mode, baseColorFactor=solid_color)
     scene.add(pyrender.Mesh.from_trimesh(mesh, material=material, smooth=True))
     if bool(getattr(vis_cfg, "mesh_wireframe", False)):
@@ -394,7 +396,13 @@ def add_body_mesh(scene, trimesh, pyrender, vertices, faces, color, vis_cfg=None
         if abs(wire_scale - 1.0) > 1e-6:
             center = wire_mesh.vertices.mean(axis=0, keepdims=True)
             wire_mesh.vertices = center + (wire_mesh.vertices - center) * wire_scale
-        wire_color = list(getattr(vis_cfg, "mesh_wireframe_color", [0.02, 0.02, 0.025, 0.22]))
+        if bool(getattr(vis_cfg, "mesh_wireframe_match_mesh_color", False)):
+            wire_factor = float(getattr(vis_cfg, "mesh_wireframe_color_factor", 0.45))
+            wire_alpha = float(getattr(vis_cfg, "mesh_wireframe_alpha", 0.14))
+            wire_rgb = np.clip(np.asarray(solid_color[:3], dtype=np.float32) * wire_factor, 0.0, 1.0)
+            wire_color = [float(wire_rgb[0]), float(wire_rgb[1]), float(wire_rgb[2]), wire_alpha]
+        else:
+            wire_color = list(getattr(vis_cfg, "mesh_wireframe_color", [0.02, 0.02, 0.025, 0.22]))
         wire_mat = pyrender.MetallicRoughnessMaterial(
             metallicFactor=0.0,
             roughnessFactor=0.55,
@@ -427,7 +435,7 @@ def _add_feature_polyline(scene, trimesh, pyrender, points, radius, material, cl
         _add_feature_segment(scene, trimesh, pyrender, start, end, radius, material)
 
 
-def add_body_features(scene, trimesh, pyrender, joints, vis_cfg):
+def add_body_features(scene, trimesh, pyrender, joints, vis_cfg, mesh_color=None):
     if joints.shape[0] <= 21:
         return
     head = joints[15]
@@ -440,11 +448,17 @@ def add_body_features(scene, trimesh, pyrender, joints, vis_cfg):
     forward = _safe_normalize(np.cross(right, up), [0.0, 0.0, 1.0])
     head_scale = max(0.08, float(np.linalg.norm(head - neck)))
 
-    color = tuple(getattr(vis_cfg, "face_feature_color", [0.02, 0.02, 0.02, 1.0]))
+    if mesh_color is not None and bool(getattr(vis_cfg, "face_feature_match_mesh_color", False)):
+        face_factor = float(getattr(vis_cfg, "face_feature_color_factor", 0.42))
+        face_rgb = np.clip(np.asarray(mesh_color[:3], dtype=np.float32) * face_factor, 0.0, 1.0)
+        color = (float(face_rgb[0]), float(face_rgb[1]), float(face_rgb[2]), 1.0)
+    else:
+        color = tuple(getattr(vis_cfg, "face_feature_color", [0.02, 0.02, 0.02, 1.0]))
     material = pyrender.MetallicRoughnessMaterial(metallicFactor=0.0, roughnessFactor=0.35,
                                                   alphaMode='OPAQUE', baseColorFactor=color)
     line_radius = float(getattr(vis_cfg, "face_line_radius", 0.006))
-    eye_radius = head_scale * 0.055
+    contour_radius = float(getattr(vis_cfg, "face_contour_radius", line_radius))
+    detail_radius = float(getattr(vis_cfg, "face_detail_radius", min(line_radius * 0.55, head_scale * 0.018)))
     face_center = head - up * head_scale * 0.03 + forward * head_scale * 0.36
     eye_center = face_center + up * head_scale * 0.11
 
@@ -456,24 +470,25 @@ def add_body_features(scene, trimesh, pyrender, joints, vis_cfg):
             + up * np.sin(theta) * head_scale * 0.42
             + forward * head_scale * 0.025
         )
-    _add_feature_polyline(scene, trimesh, pyrender, contour, line_radius, material, closed=True)
+    _add_feature_polyline(scene, trimesh, pyrender, contour, contour_radius, material, closed=True)
 
     for side in (-1.0, 1.0):
-        eye = trimesh.creation.uv_sphere(radius=eye_radius, count=[8, 8])
-        eye.apply_translation(eye_center + right * side * head_scale * 0.16)
-        scene.add(pyrender.Mesh.from_trimesh(eye, material=material, smooth=True))
-        eye_line_start = eye_center + right * side * head_scale * 0.08
-        eye_line_end = eye_center + right * side * head_scale * 0.24
-        _add_feature_segment(scene, trimesh, pyrender, eye_line_start, eye_line_end, line_radius, material)
+        eye_mid = eye_center + right * side * head_scale * 0.16 + forward * head_scale * 0.045
+        eye_left = eye_mid - right * head_scale * 0.075
+        eye_right = eye_mid + right * head_scale * 0.075
+        brow_left = eye_left + up * head_scale * 0.060
+        brow_right = eye_right + up * head_scale * 0.070
+        _add_feature_segment(scene, trimesh, pyrender, eye_left, eye_right, detail_radius, material)
+        _add_feature_segment(scene, trimesh, pyrender, brow_left, brow_right, detail_radius * 0.85, material)
 
     nose_bridge = face_center + up * head_scale * 0.09 + forward * head_scale * 0.04
     nose_tip = face_center - up * head_scale * 0.08 + forward * head_scale * 0.20
-    _add_feature_segment(scene, trimesh, pyrender, nose_bridge, nose_tip, line_radius * 1.15, material)
+    _add_feature_segment(scene, trimesh, pyrender, nose_bridge, nose_tip, detail_radius * 1.25, material)
 
     mouth_center = face_center - up * head_scale * 0.22 + forward * head_scale * 0.04
     mouth_left = mouth_center - right * head_scale * 0.14
     mouth_right = mouth_center + right * head_scale * 0.14
-    _add_feature_segment(scene, trimesh, pyrender, mouth_left, mouth_right, line_radius, material)
+    _add_feature_segment(scene, trimesh, pyrender, mouth_left, mouth_right, detail_radius, material)
 
 
 def add_joint_body_mesh(scene, trimesh, pyrender, joints, color, vis_cfg):
@@ -626,6 +641,54 @@ def add_screen_mesh_outline(frame, vertices_per_view, camera_pose, yfov, vis_cfg
     return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0)
 
 
+def add_screen_mesh_silhouette(frame, vertices_per_view, faces, camera_pose, yfov, vis_cfg):
+    try:
+        import cv2
+    except Exception:
+        return frame
+    if faces is None or len(faces) == 0:
+        return frame
+
+    height, width = frame.shape[:2]
+    overlay = frame.copy()
+    color = _rgb255(getattr(vis_cfg, "mesh_silhouette_color", [0.01, 0.01, 0.015, 1.0]))
+    alpha = float(getattr(vis_cfg, "mesh_silhouette_alpha", 0.9))
+    line_width = max(1, int(getattr(vis_cfg, "mesh_silhouette_width", 2)))
+    faces_np = np.asarray(faces, dtype=np.int64)
+    view_matrix = np.linalg.inv(camera_pose)
+
+    for vertices in vertices_per_view:
+        screen, valid_vertices = project_points_to_screen(vertices, camera_pose, yfov, width, height)
+        vertices_h = np.concatenate([vertices, np.ones((vertices.shape[0], 1), dtype=vertices.dtype)], axis=1)
+        camera_vertices = (view_matrix @ vertices_h.T).T[:, :3]
+        tri = camera_vertices[faces_np]
+        normals = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        centers = tri.mean(axis=1)
+        visible_face = np.einsum("ij,ij->i", normals, -centers) > 0.0
+        valid_faces = valid_vertices[faces_np].all(axis=1)
+
+        edge_faces = {}
+        for face_id, face in enumerate(faces_np):
+            if not valid_faces[face_id]:
+                continue
+            face_visible = bool(visible_face[face_id])
+            for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0])):
+                key = (int(a), int(b)) if a < b else (int(b), int(a))
+                edge_faces.setdefault(key, []).append(face_visible)
+
+        for (a, b), adjacent in edge_faces.items():
+            if not (valid_vertices[a] and valid_vertices[b]):
+                continue
+            is_silhouette = len(adjacent) == 1 or (any(adjacent) and not all(adjacent))
+            if not is_silhouette:
+                continue
+            p0 = tuple(np.round(screen[a]).astype(np.int32))
+            p1 = tuple(np.round(screen[b]).astype(np.int32))
+            cv2.line(overlay, p0, p1, color, line_width, cv2.LINE_AA)
+
+    return cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0)
+
+
 def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_path, vis_cfg, visual_cfg, use_proxy_mesh=True):
     trimesh, pyrender, RenderFlags = import_renderer()
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -644,6 +707,7 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
     draw_3d_skeleton = bool(vis_cfg.use_skeleton_overlay) and skeleton_mode in ("3d", "both")
     draw_screen_skeleton = bool(vis_cfg.use_skeleton_overlay) and skeleton_mode in ("screen", "2d", "both")
     draw_mesh_outline = bool(getattr(vis_cfg, "mesh_screen_outline", True))
+    draw_mesh_silhouette = bool(getattr(vis_cfg, "mesh_silhouette", False))
     vertices_list, joints_list = zip(*[center_motion(vertices, joints) for vertices, joints in zip(vertices_list, joints_list)])
     spacing = float(getattr(vis_cfg, "view_spacing", 1.65))
     offsets_x = torch.linspace(-spacing * (num_views - 1) / 2, spacing * (num_views - 1) / 2, num_views,
@@ -675,7 +739,7 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
             elif use_proxy_mesh and mesh_mode in ("smpl", "smpl_fit"):
                 add_body_mesh(scene, trimesh, pyrender, cur_vertices, faces, colors[idx], vis_cfg)
                 if bool(getattr(vis_cfg, "show_body_features", False)):
-                    add_body_features(scene, trimesh, pyrender, cur_joints, vis_cfg)
+                    add_body_features(scene, trimesh, pyrender, cur_joints, vis_cfg, mesh_color=colors[idx])
             if draw_3d_skeleton:
                 bone_color = skeleton_colors[idx] if idx < len(skeleton_colors) else tuple(vis_cfg.skeleton_color)
                 joint_color = bone_color if bool(getattr(vis_cfg, "skeleton_match_mesh_color", True)) else tuple(vis_cfg.joint_color)
@@ -698,8 +762,14 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
         ], dtype=np.float32)
         scene.add(camera, pose=cam_pose)
 
-        light = pyrender.DirectionalLight(color=[1, 1, 1], intensity=3.0)
-        for light_pos in ([0, -1, 2], [0, 1, 2], [2, 2, 3]):
+        key_light = pyrender.PointLight(color=[1, 1, 1], intensity=float(getattr(vis_cfg, "key_light_intensity", 18.0)))
+        fill_light = pyrender.PointLight(color=[1, 1, 1], intensity=float(getattr(vis_cfg, "fill_light_intensity", 7.0)))
+        rim_light = pyrender.PointLight(color=[1, 1, 1], intensity=float(getattr(vis_cfg, "rim_light_intensity", 12.0)))
+        for light, light_pos in (
+            (key_light, [-2.2, 2.4, 2.8]),
+            (fill_light, [2.4, 1.4, 3.6]),
+            (rim_light, [0.0, 2.8, -1.8]),
+        ):
             light_pose = np.eye(4)
             light_pose[:3, 3] = light_pos
             scene.add(light, pose=light_pose)
@@ -708,6 +778,8 @@ def render_motion_video(vertices_list, joints_list, faces, caption, labels, out_
         color = color[..., :3].copy()
         if draw_mesh_outline and len(frame_vertices) > 0:
             color = add_screen_mesh_outline(color, frame_vertices, cam_pose, camera_yfov, vis_cfg)
+        if draw_mesh_silhouette and len(frame_vertices) > 0:
+            color = add_screen_mesh_silhouette(color, frame_vertices, faces, cam_pose, camera_yfov, vis_cfg)
         if draw_screen_skeleton:
             color = add_screen_skeleton_overlay(
                 color, frame_joints, cam_pose, camera_yfov, skeleton_chain, vis_cfg,
@@ -808,6 +880,7 @@ def visualize_sample(result, cfg, vis_cfg, visual_cfg, mean, std, smpl_model, fa
 
     if align_visual_lengths and mesh_mode in ("smpl_fit", "joint", "none"):
         joints_list = [resample_sequence(joints, reference_frames) for joints in joints_list]
+    skeleton_joints_list = [joints.clone() for joints in joints_list]
 
     if mesh_mode == "joint":
         vertices_list = joints_list
@@ -860,12 +933,33 @@ def visualize_sample(result, cfg, vis_cfg, visual_cfg, mean, std, smpl_model, fa
         joints_list = [resample_sequence(joints, reference_frames) for joints in joints_list]
 
     safe_name = str(name).replace("/", "_").replace("\\", "_")
-    suffix = "_skeleton" if bool(getattr(vis_cfg, "skeleton_only", False)) else ""
+    separate_skeleton = bool(getattr(vis_cfg, "save_skeleton_separate", False)) and not bool(getattr(vis_cfg, "skeleton_only", False))
+    suffix = "_skeleton" if bool(getattr(vis_cfg, "skeleton_only", False)) else "_mesh" if separate_skeleton else ""
     out_name = f"{safe_name}_{task_type}_{pair_name}{suffix}.mp4"
     out_path = pjoin(vis_cfg.output_dir, out_name)
     saved_path = render_motion_video(vertices_list, joints_list, faces, caption, labels, out_path, vis_cfg, visual_cfg,
                                      use_proxy_mesh=use_proxy_mesh)
     print(f"Saved: {os.path.abspath(saved_path)}", flush=True)
+    if separate_skeleton:
+        skel_cfg = copy.copy(vis_cfg)
+        skel_cfg.mesh_mode = "none"
+        skel_cfg.use_proxy_mesh = False
+        skel_cfg.use_skeleton_overlay = True
+        skel_cfg.skeleton_overlay_mode = "screen"
+        skel_cfg.skeleton_overlay_source = "target"
+        skel_cfg.mesh_screen_outline = False
+        skel_cfg.skeleton_match_mesh_color = True
+        skel_cfg.skeleton_screen_alpha = max(float(getattr(skel_cfg, "skeleton_screen_alpha", 0.95)), 0.95)
+        skel_cfg.skeleton_screen_bone_width = max(int(getattr(skel_cfg, "skeleton_screen_bone_width", 2)), 2)
+        skel_cfg.skeleton_screen_joint_radius = max(int(getattr(skel_cfg, "skeleton_screen_joint_radius", 3)), 3)
+        skeleton_out_name = f"{safe_name}_{task_type}_{pair_name}_skeleton.mp4"
+        skeleton_out_path = pjoin(vis_cfg.output_dir, skeleton_out_name)
+        skeleton_faces = np.zeros((0, 3), dtype=np.int64)
+        saved_skeleton_path = render_motion_video(
+            skeleton_joints_list, skeleton_joints_list, skeleton_faces, caption, labels,
+            skeleton_out_path, skel_cfg, visual_cfg, use_proxy_mesh=False,
+        )
+        print(f"Saved skeleton: {os.path.abspath(saved_skeleton_path)}", flush=True)
 
 
 def main():

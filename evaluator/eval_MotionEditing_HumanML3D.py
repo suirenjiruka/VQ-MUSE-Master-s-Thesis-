@@ -135,8 +135,9 @@ def build_generation_loader(trans_cfg, hml3d_opt, mean, std, split, batch_size, 
     w_vectorizer = WordVectorizer(pjoin(project_root, 'glove'), 'our_vab')
     split_file = build_task_split(trans_cfg, hml3d_opt, split, "generation", motionfix_start_id)
     dataset = Text2MotionDatasetEval(hml3d_opt, mean, std, split_file, w_vectorizer)
-    loader = DataLoader(dataset, batch_size=batch_size, drop_last=False, num_workers=num_workers,
-                        shuffle=False, pin_memory=True, collate_fn=collate_fn)
+    # Match training/official HumanML3D R-precision protocol: each batch is the retrieval pool.
+    loader = DataLoader(dataset, batch_size=batch_size, drop_last=True, num_workers=num_workers,
+                        shuffle=True, pin_memory=True, collate_fn=collate_fn)
     return loader
 
 
@@ -157,6 +158,8 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
     vq_model.eval()
 
     text_emb_list, gt_emb_list, pred_emb_list = [], [], []
+    r_precision_sum = np.zeros(3)
+    matching_sum = 0.0
     nb_sample = 0
     inference_seconds = 0.0
 
@@ -164,8 +167,7 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, _, _ = batch
         pose = pose.to(device).float()
         m_length = m_length.to(device).long()
-        bs = pose.shape[0]
-        has_source = torch.zeros(bs, device=device, dtype=torch.long)
+        has_source = torch.zeros_like(m_length, device=device)
 
         # Generate with null source condition, which is the generation branch of the current model
         sync_cuda_if_needed(device)
@@ -182,21 +184,25 @@ def evaluation_generation_hml(eval_loader, trans, vq_model, eval_wrapper, device
         text_emb, gt_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pose, m_length)
         text_emb_pred, pred_emb = eval_wrapper.get_co_embeddings(word_embeddings, pos_one_hots, sent_len, pred_motion, m_length)
 
+        text_np_batch = text_emb_pred.cpu().numpy()
+        pred_np_batch = pred_emb.cpu().numpy()
+        r_precision_sum += calculate_R_precision(text_np_batch, pred_np_batch, top_k=3, sum_all=True)
+        matching_sum += euclidean_distance_matrix(text_np_batch, pred_np_batch).trace()
+
         text_emb_list.append(text_emb_pred)
         gt_emb_list.append(gt_emb)
         pred_emb_list.append(pred_emb)
-        nb_sample += bs
+        nb_sample += len(pred_emb)
 
     if nb_sample == 0:
         print("No generation samples were found in eval_loader.")
         return None
 
-    text_np = torch.cat(text_emb_list, dim=0).cpu().numpy()
     gt_np = torch.cat(gt_emb_list, dim=0).cpu().numpy()
     pred_np = torch.cat(pred_emb_list, dim=0).cpu().numpy()
 
-    r_precision = calculate_R_precision(text_np, pred_np, top_k=3, sum_all=True) / nb_sample
-    matching = euclidean_distance_matrix(text_np, pred_np).trace() / nb_sample
+    r_precision = r_precision_sum / nb_sample
+    matching = matching_sum / nb_sample
 
     gt_mu, gt_cov = calculate_activation_statistics(gt_np)
     mu, cov = calculate_activation_statistics(pred_np)

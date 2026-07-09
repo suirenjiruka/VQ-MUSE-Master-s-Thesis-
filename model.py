@@ -141,6 +141,9 @@ class VAMotion(nn.Module):
         self.text_drop_prob = getattr(cfg.training, "t_drop", getattr(cfg.training, "text_cfg_drop_prob", 0.1))   # text dropout for CFG
         self.source_drop_prob = getattr(cfg.training, "v_drop", getattr(cfg.training, "source_cfg_drop_prob", 0.0)) # source dropout for CFG
         self.source_token_drop_prob = getattr(cfg.training, "s_drop", getattr(cfg.training, "source_token_drop_prob", 0.0))
+        self.mask_ratio_lo = float(getattr(cfg.training, "mask_lo", 0.0))
+        self.mask_ratio_hi = float(getattr(cfg.training, "mask_hi", 1.0))
+        self.mask_ratio_schedule = getattr(cfg.training, "mask_schedule", "cosine")
         self.use_abs_pe = getattr(cfg.model, "use_abs_pe", False)
         init_std = math.sqrt(1 / self.latent_dim / 3) # init std
         self.noise_schedule = cosine_schedule # for cosine reduction, using on generation masking
@@ -624,8 +627,14 @@ class VAMotion(nn.Module):
 
         # ---- target masking: MoMask/BERT-style, per-sample uniform ratio ----
         bs = target_ids.shape[0]
+        mask_lo = max(0.0, min(float(self.mask_ratio_lo), 1.0))
+        mask_hi = max(mask_lo, min(float(self.mask_ratio_hi), 1.0))
         rand_time = uniform((bs,), device=target_ids.device)
-        rand_mask_probs = self.noise_schedule(rand_time) # sample mask ratio
+        if self.mask_ratio_schedule == "cosine":
+            rand_mask_probs = self.noise_schedule(rand_time)
+        else:
+            rand_mask_probs = rand_time
+        rand_mask_probs = rand_mask_probs * (mask_hi - mask_lo) + mask_lo
         # token num to predict
         n_valid = target_mask.sum(dim=1)
         num_pred = (n_valid.float() * rand_mask_probs).round().clamp(min=1).long()

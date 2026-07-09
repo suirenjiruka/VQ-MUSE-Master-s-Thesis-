@@ -50,7 +50,7 @@ class TaskRatioSampler(Sampler):
 def copy_runtime_training_overrides(saved_cfg, runtime_cfg):
     if hasattr(runtime_cfg.training, "curriculum"):
         saved_cfg.training.curriculum = runtime_cfg.training.curriculum
-    for key in ("max_epoch", "edit_sample_ratio", "m_drop", "v_drop", "t_drop", "s_drop"):
+    for key in ("max_epoch", "edit_sample_ratio", "m_drop", "v_drop", "t_drop", "s_drop", "mask_lo", "mask_hi", "mask_schedule"):
         if key in runtime_cfg.training:
             saved_cfg.training[key] = runtime_cfg.training[key]
     for key in ("weight_delta", "weight_latent", "weight_rank", "weight_same_src"):

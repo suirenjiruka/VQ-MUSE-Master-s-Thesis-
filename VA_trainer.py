@@ -150,10 +150,19 @@ class VA_motion_trainer:
             ("t_drop", "text_drop_prob"),
             ("v_drop", "source_drop_prob"),
             ("s_drop", "source_token_drop_prob"),
+            ("mask_lo", "mask_ratio_lo"),
+            ("mask_hi", "mask_ratio_hi"),
         ):
             if key in stage:
                 setattr(self.config.training, key, float(stage[key]))
                 setattr(self.training_model, attr, float(stage[key]))
+        if changed and ("mask_lo" in stage or "mask_hi" in stage):
+            print(f"mask ratio range: [{self.training_model.mask_ratio_lo:.2f}, {self.training_model.mask_ratio_hi:.2f}]")
+        if "mask_schedule" in stage:
+            self.config.training.mask_schedule = stage["mask_schedule"]
+            self.training_model.mask_ratio_schedule = stage["mask_schedule"]
+            if changed:
+                print(f"mask ratio schedule: {self.training_model.mask_ratio_schedule}")
 
         if "delta_beta" in stage:
             self.config.model.delta_beta = float(stage["delta_beta"])

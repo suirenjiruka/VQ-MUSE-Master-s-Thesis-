@@ -11,8 +11,7 @@ num_samples: 4
 start_index: 0
 random_select: True
 motionfix_start_id: 400000
-seed: 18562
-
+seed: 15622
 # Sampling
 time_steps: 20
 cond_scale: 2
@@ -42,38 +41,57 @@ mesh_warp_to_skeleton: False
 skeleton_overlay_source: 'mesh'  # mesh = fitted SMPL joints; target = recovered HML skeleton
 skeleton_overlay_mode: 'screen'  # screen = draw skeleton over final frame so mesh cannot hide it; 3d | both are also supported
 skeleton_match_mesh_color: True
-show_body_features: True
+save_skeleton_separate: True
+show_body_features: False
 align_visual_lengths: True
-use_skeleton_overlay: True
+use_skeleton_overlay: False
 allow_skeleton_fallback: False
 
 # Appearance
-bg_color: [0.97, 0.98, 0.99, 1.0]
-ambient_light: [0.56, 0.56, 0.56]
-left_color: [0.32, 0.50, 1.00, 1.0]
-target_color: [0.24, 0.72, 0.43, 1.0]
-right_color: [1.00, 0.44, 0.24, 1.0]
+bg_color: [0.995, 0.997, 1.000, 1.0]
+ambient_light: [0.58, 0.58, 0.58]
+key_light_intensity: 44.0
+fill_light_intensity: 7.0
+rim_light_intensity: 30.0
+left_color: [0.62, 0.86, 1.00, 1.0]
+target_color: [0.48, 1.00, 0.66, 1.0]
+right_color: [1.00, 0.74, 0.46, 1.0]
 mesh_alpha: 1.0
+mesh_metallic: 0.0
+mesh_roughness: 0.78
 mesh_wireframe: True
-mesh_wireframe_color: [0.03, 0.03, 0.035, 0.12]
-mesh_wireframe_scale: 1.001
-mesh_screen_outline: True
+mesh_wireframe_match_mesh_color: True
+mesh_wireframe_color_factor: 0.30
+mesh_wireframe_alpha: 0.38
+mesh_wireframe_color: [0.02, 0.02, 0.025, 0.045]
+mesh_wireframe_scale: 1.0008
+mesh_screen_outline: False
 mesh_outline_color: [0.01, 0.01, 0.015, 1.0]
-mesh_outline_alpha: 0.88
-mesh_outline_width: 3
+mesh_outline_alpha: 0.92
+mesh_outline_width: 4
+mesh_silhouette: False
+mesh_silhouette_color: [0.03, 0.03, 0.035, 1.0]
+mesh_silhouette_alpha: 0.62
+mesh_silhouette_width: 1
 skeleton_color: [0.20, 0.21, 0.23, 0.62]
 joint_color: [0.12, 0.12, 0.13, 0.70]
 skeleton_screen_alpha: 0.58
 skeleton_screen_bone_width: 1
 skeleton_screen_joint_radius: 2
 skeleton_screen_joint_halo: False
-face_feature_color: [0.02, 0.02, 0.02, 1.0]
-face_line_radius: 0.006
+face_feature_match_mesh_color: True
+face_feature_color_factor: 0.36
+face_feature_color: [0.06, 0.06, 0.065, 1.0]
+face_line_radius: 0.010
+face_contour_radius: 0.012
+face_detail_radius: 0.0045
 floor_color: [0.86, 0.89, 0.94, 1.0]
 bone_radius: 0.006
 joint_radius: 0.010
-caption_bottom_margin: 118
-caption_bar_height: 34
+caption_bottom_margin: 170
+caption_bar_height: 48
+caption_font_scale: 0.72
+caption_thickness: 2
 view_spacing: 1.65
 mesh_limb_radius: 0.055
 mesh_torso_radius: 0.085
