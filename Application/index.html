@@ -134,13 +134,14 @@
   <div id="paramWrap">
     <button id="paramBtn">⚙ 推論參數</button>
     <div id="params" class="hidden">
-      <label>Time steps <b id="v_ts">10</b><input type="range" id="p_ts" min="1" max="30" step="1" value="10"></label>
-      <label>Gen scale <b id="v_gs">2.0</b><input type="range" id="p_gs" min="0" max="8" step="0.5" value="2"></label>
+      <label>Time steps <b id="v_ts">12</b><input type="range" id="p_ts" min="1" max="30" step="1" value="12"></label>
+      <label>Gen scale <b id="v_gs">3.0</b><input type="range" id="p_gs" min="0" max="8" step="0.5" value="3"></label>
       <label>Edit scale <b id="v_es">2.0</b><input type="range" id="p_es" min="0" max="8" step="0.5" value="2"></label>
-      <label>Source scale <b id="v_ss">1.0</b><input type="range" id="p_ss" min="0" max="4" step="0.25" value="1"></label>
+      <label>Source scale <b id="v_ss">1.2</b><input type="range" id="p_ss" min="0" max="4" step="0.1" value="1.2"></label>
+      <label>Source in-paint <b id="v_sk">0.50</b><input type="range" id="p_sk" min="0" max="0.9" step="0.05" value="0.5"></label>
       <label>Temperature <b id="v_tp">1.0</b><input type="range" id="p_tp" min="0.1" max="2" step="0.1" value="1"></label>
       <label>Top-k thres <b id="v_tk">0.95</b><input type="range" id="p_tk" min="0.5" max="1" step="0.05" value="0.95"></label>
-      <label>Gen length <b id="v_ln">120f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="120"></label>
+      <label>Gen length <b id="v_ln">196f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="196"></label>
       <label class="chk"><input type="checkbox" id="p_gum" checked> Gumbel sampling</label>
     </div>
   </div>
@@ -183,6 +184,7 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { MarchingCubes } from 'three/addons/objects/MarchingCubes.js';
 
 /* ============================================================
    1. 3D SCENE  (拖曳旋轉 + 平移 + 縮放)
@@ -235,42 +237,70 @@ function resize(){
 new ResizeObserver(resize).observe(host); resize();
 
 /* ============================================================
-   2. HUMANOID  (22-joint SMPL skeleton → capsule mesh)
+   2. HUMANOID  (22-joint SMPL skeleton → metaball skin mesh)
+   沿骨架灑金屬球，用 MarchingCubes 抽出一張平滑融合的皮膚曲面：
+   四肢連成一體，是連續的肉體 mesh，不是一根根膠囊拼的火柴人。
 ============================================================ */
 const PARENT = [-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19];
-const BONE = i => PARENT[i];
 
-// unified skin material → reads as one continuous body mesh, not a wire skeleton
-const skinMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.6, metalness:0.05 });
-// per-part radii (thick torso, tapered limbs) so the capsules+joint fillers form a solid mannequin
-const RB = {3:.115,6:.125,9:.115, 1:.085,2:.085,4:.078,5:.078,7:.062,8:.062,10:.05,11:.05,
-            12:.055,13:.08,14:.08,15:.062, 16:.072,17:.072,18:.058,19:.058,20:.046,21:.046};
-const RJ = {0:.125,3:.11,6:.12,9:.11, 1:.085,2:.085,4:.076,5:.076,7:.06,8:.06,10:.05,11:.05,
-            12:.06,13:.072,14:.072,15:.125, 16:.072,17:.072,18:.056,19:.056,20:.05,21:.05};
+// skin material — one continuous surface
+const skinMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.62, metalness:0.04 });
+// per-joint body radius (world metres) — 比骨架飽滿，四肢/軀幹才有肉感
+const RJ = [0.140,0.090,0.090,0.130,0.066,0.066,0.135,0.052,0.052,0.145,0.046,0.046,
+            0.055,0.090,0.090,0.100,0.078,0.078,0.058,0.058,0.046,0.046];
 
 const figure = new THREE.Group(); figure.visible = false; scene.add(figure);  // 起始空場景，生成後才顯示
-const jointMeshes = [], boneMeshes = [];
-for(let i=0;i<22;i++){
-  const r = RJ[i] ?? 0.05;
-  const s = new THREE.Mesh(new THREE.SphereGeometry(r, 22, 18), skinMat);   // gap-filler at each joint
-  s.castShadow = true; figure.add(s); jointMeshes.push(s);
+
+// --- MarchingCubes metaball 皮膚 ---
+// 單球世界半徑 R ⇒ strength = (isolation+subtract)·(R/BOX)²；重疊球相加自然融合成連續皮膚。
+const MC_RES=64, MC_BOX=2.2, MC_SUB=12, MC_ISO=80, MC_FUSE=0.55;
+const MC_K = (MC_ISO + MC_SUB) / (MC_BOX*MC_BOX);       // strength = MC_FUSE·MC_K·R²
+const mc = new MarchingCubes(MC_RES, skinMat, false, false, 300000);
+mc.isolation = MC_ISO; mc.castShadow = true; mc.scale.setScalar(MC_BOX/2);
+figure.add(mc);
+
+const _c=new THREE.Vector3(), _p=new THREE.Vector3(), _q=new THREE.Vector3();
+function _ball(p, R){                                    // 世界座標 p → [0,1] addBall
+  mc.addBall((p.x-_c.x)/MC_BOX+0.5, (p.y-_c.y)/MC_BOX+0.5, (p.z-_c.z)/MC_BOX+0.5,
+             MC_FUSE*MC_K*R*R, MC_SUB);
 }
-for(let i=1;i<22;i++){
-  const r = RB[i] ?? 0.05;
-  const c = new THREE.Mesh(new THREE.CapsuleGeometry(r, 1, 8, 16), skinMat); // limb / torso volume
-  c.castShadow = true; figure.add(c); boneMeshes.push({mesh:c, j:i, p:BONE(i), r});
+function poseFigure(joints){ // joints: Array(22) of [x,y,z]
+  _c.set(joints[0][0], 0.9, joints[0][2]);               // 體積盒隨骨盆水平移動、垂直固定(涵蓋腳到頭)
+  mc.position.copy(_c);
+  mc.reset();
+  for(let i=0;i<22;i++){ _p.fromArray(joints[i]); _ball(_p, RJ[i]); }   // 關節球
+  for(let i=1;i<22;i++){                                  // 沿骨頭補球 → 四肢連成一體
+    const par=PARENT[i]; _q.fromArray(joints[i]);
+    _p.fromArray(joints[par]); const len=_p.distanceTo(_q);
+    const rmin=Math.min(RJ[i],RJ[par]);
+    const n=Math.max(1, Math.ceil(len/(rmin*0.7)));
+    for(let k=1;k<n;k++){ const t=k/n;
+      _p.fromArray(joints[par]).lerp(_q, t);
+      _ball(_p, RJ[par]*(1-t)+RJ[i]*t);
+    }
+  }
+  mc.update();
 }
 
-const _a=new THREE.Vector3(),_b=new THREE.Vector3(),_m=new THREE.Vector3(),_d=new THREE.Vector3(),_up=new THREE.Vector3(0,1,0),_q=new THREE.Quaternion();
-function poseFigure(joints){ // joints: Array(22) of [x,y,z]
-  for(let i=0;i<22;i++) jointMeshes[i].position.set(joints[i][0],joints[i][1],joints[i][2]);
-  for(const b of boneMeshes){
-    _a.fromArray(joints[b.p]); _b.fromArray(joints[b.j]);
-    _m.addVectors(_a,_b).multiplyScalar(0.5); b.mesh.position.copy(_m);
-    _d.subVectors(_b,_a); const len=_d.length();
-    b.mesh.scale.set(1, Math.max(len - b.r*1.4, 0.02), 1);   // radius baked in geometry; scale length only
-    _d.normalize(); _q.setFromUnitVectors(_up,_d); b.mesh.quaternion.copy(_q);
+/* --- 真 SMPL mesh（後端擬合回傳的 verts + faces；播放時只更新頂點 → 即時）--- */
+const smeshMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.72, metalness:0.03, side:THREE.DoubleSide });
+const smeshGeo = new THREE.BufferGeometry();
+const smesh = new THREE.Mesh(smeshGeo, smeshMat);
+smesh.castShadow = true; smesh.visible = false; scene.add(smesh);
+let _smeshV = 0;
+function setupMesh(c){                       // c: {V, faces:Uint32Array, verts:Float32Array, F}
+  if(_smeshV !== c.V){
+    smeshGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(c.V*3), 3));
+    _smeshV = c.V;
   }
+  smeshGeo.setIndex(new THREE.BufferAttribute(c.faces, 1));   // 同一套 SMPL 拓撲，每次載入設一次
+  meshFrame(c, 0);
+  smeshGeo.computeBoundingSphere();
+}
+function meshFrame(c, f){
+  const V=c.V, pos=smeshGeo.getAttribute('position');
+  pos.array.set(c.verts.subarray(f*V*3, (f+1)*V*3)); pos.needsUpdate=true;
+  smeshGeo.computeVertexNormals();
 }
 
 /* ============================================================
@@ -350,20 +380,40 @@ function readParams(mode){
   const g=id=>+document.getElementById(id).value;
   return { time_steps:g('p_ts'),
     cond_scale: mode==='gen'? g('p_gs') : g('p_es'),   // gen scale / edit scale
-    source_scale:g('p_ss'), temperature:g('p_tp'), topk:g('p_tk'),
+    source_scale:g('p_ss'), source_keep_ratio:g('p_sk'),   // in-paint 比例(edit 時鎖住的 source token)
+    temperature:g('p_tp'), topk:g('p_tk'),
     gumbel:document.getElementById('p_gum').checked, length:g('p_ln') };
 }
 
+function framesFromFlat(a, F, V){                 // Float32Array → [[x,y,z]×V]×F
+  const out=[]; for(let f=0; f<F; f++){ const fr=[]; for(let j=0;j<V;j++){ const o=(f*V+j)*3;
+    fr.push([a[o],a[o+1],a[o+2]]); } out.push(fr); } return out;
+}
+async function parseClip(r){                       // 解析後端回應 → 統一 clip 物件
+  const id=r.headers.get('X-Motion-Id');
+  const ct=r.headers.get('Content-Type')||'';
+  if(ct.includes('octet-stream')){
+    const a=new Float32Array(await r.arrayBuffer());
+    const tag=a[0]|0, F=a[1]|0, V=a[2]|0, Fc=a[3]|0, fpsv=a[4]; let off=5;
+    if(tag===1){                                   // mesh：faces + verts
+      const faces=Uint32Array.from(a.subarray(off, off+Fc*3)); off+=Fc*3;
+      const verts=a.slice(off);                    // 複製出自有 buffer
+      return {kind:'mesh', F, V, faces, verts, fps:fpsv, backendId:id};
+    }
+    return {kind:'joints', frames:framesFromFlat(a.subarray(off), F, V), fps:fpsv, backendId:id};
+  }
+  const d=await r.json();                           // 舊版 JSON 後援
+  return {kind:'joints', frames:normalizeJoints(d.joints), fps:d.fps||20, backendId:d.id};
+}
 async function requestGenerate(text){
   const p=readParams('gen');
   if(backendOk){
     const r=await fetch(API+'/generate',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text, length:p.length, params:p})});
     if(!r.ok) throw new Error('generate '+r.status);
-    const d=await r.json(); fps=d.fps||fps;
-    return { joints:normalizeJoints(d.joints), backendId:d.id };
+    return await parseClip(r);
   }
-  await sleep(500); return { joints:synth(textToParams(text)), backendId:null };
+  await sleep(500); return {kind:'joints', frames:synth(textToParams(text)), fps:20, backendId:null};
 }
 async function requestEdit(node, text){
   const p=readParams('edit');
@@ -371,10 +421,12 @@ async function requestEdit(node, text){
     const r=await fetch(API+'/edit',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({source_id:node.backendId, text, params:p})});
     if(!r.ok) throw new Error('edit '+r.status);
-    const d=await r.json(); fps=d.fps||fps;
-    return { joints:normalizeJoints(d.joints), backendId:d.id };
+    return await parseClip(r);
   }
-  await sleep(500); return { joints:mockEdit(node.motion, text), backendId:null };
+  // 無後端後援：只有關節動作能 mock；mesh clip 無法逐關節編輯 → 原樣返回
+  if(node.clip.kind==='joints'){ await sleep(500);
+    return {kind:'joints', frames:mockEdit(node.clip.frames, text), fps:node.clip.fps||20, backendId:null}; }
+  await sleep(300); return node.clip;
 }
 function mockEdit(sourceMotion, text){
   const t=text.toLowerCase(); const src=sourceMotion; const F=src.length;
@@ -399,13 +451,23 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
    4. PLAYER
 ============================================================ */
 let clip=null, fIdx=0, playing=true, speed=1, fps=20, acc=0;
-function loadClip(motion){
-  clip=motion; fIdx=0; acc=0; playing=true; playBtn.textContent='⏸';
-  figure.visible=true;                 // 首次生成 → 顯示角色
-  poseFigure(clip[0]);
+function clipLen(c){ return c.kind==='mesh' ? c.F : c.frames.length; }
+function setFrame(f){
+  if(!clip) return;
+  if(clip.kind==='mesh') meshFrame(clip, f);
+  else poseFigure(clip.frames[f]);
+}
+function loadClip(c){
+  clip=c; fIdx=0; acc=0; playing=true; playBtn.textContent='⏸'; fps=c.fps||fps;
+  const isMesh = c.kind==='mesh';
+  figure.visible = !isMesh;            // metaball 只用於 mock 關節動作
+  smesh.visible  = isMesh;             // 真 SMPL mesh 用於後端輸出
+  if(isMesh) setupMesh(c);
+  setFrame(0);
+  const L=clipLen(c);
   document.getElementById('playCtl').style.visibility='visible';
-  document.getElementById('scrub').max=clip.length-1;
-  document.getElementById('framePill').textContent=`${clip.length} frames · ${(clip.length/fps).toFixed(1)}s`;
+  document.getElementById('scrub').max=L-1;
+  document.getElementById('framePill').textContent=`${L} frames · ${(L/fps).toFixed(1)}s`;
 }
 const clock=new THREE.Clock();
 function tick(){
@@ -413,7 +475,7 @@ function tick(){
   const dt=clock.getDelta();
   if(clip && playing){
     acc+=dt*speed*fps;
-    if(acc>=1){ fIdx=(fIdx+Math.floor(acc))%clip.length; acc%=1; poseFigure(clip[fIdx]);
+    if(acc>=1){ const L=clipLen(clip); fIdx=(fIdx+Math.floor(acc))%L; acc%=1; setFrame(fIdx);
       document.getElementById('scrub').value=fIdx;
       document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; }
   }
@@ -425,14 +487,14 @@ tick();
    5. HISTORY TREE  (git-style branches)
 ============================================================ */
 let nodes=[], curId=null, nid=0;
-function makeNode(text, motion, parentId, isRoot, backendId){
-  const n={id:nid++, text, motion, backendId:backendId||null, parent:parentId, children:[], root:!!isRoot};
+function makeNode(text, clip, parentId, isRoot, backendId){
+  const n={id:nid++, text, clip, backendId:backendId||null, parent:parentId, children:[], root:!!isRoot};
   nodes.push(n);
   if(parentId!=null){ const p=nodes.find(x=>x.id===parentId); p&&p.children.push(n.id); }
   return n;
 }
-function resetHistory(rootText, motion, backendId){ nodes=[]; nid=0; const r=makeNode(rootText,motion,null,true,backendId); curId=r.id; renderGraph(); }
-function addEdit(text, motion, backendId){ const n=makeNode(text,motion,curId,false,backendId); curId=n.id; renderGraph(); }
+function resetHistory(rootText, clip, backendId){ nodes=[]; nid=0; const r=makeNode(rootText,clip,null,true,backendId); curId=r.id; renderGraph(); }
+function addEdit(text, clip, backendId){ const n=makeNode(text,clip,curId,false,backendId); curId=n.id; renderGraph(); }
 
 const graphEl=document.getElementById('gInner'), edgesEl=document.getElementById('edges'), emptyH=document.getElementById('emptyH');
 function renderGraph(){
@@ -465,7 +527,7 @@ function renderGraph(){
     graphEl.appendChild(el);
   });
 }
-function selectNode(id){ curId=id; const n=nodes.find(x=>x.id===id); loadClip(n.motion); renderGraph();
+function selectNode(id){ curId=id; const n=nodes.find(x=>x.id===id); loadClip(n.clip); renderGraph();
   setMode('edit');  // 選了歷史節點 → 準備以它為 source 編輯
   document.getElementById('prompt').placeholder=`編輯「${n.text.slice(0,18)}…」— 例如 slower / mirror / raise arms`;
 }
@@ -493,14 +555,14 @@ async function run(){
   loadTxt.textContent = mode==='gen' ? '生成動作中…' : '套用編輯中…';
   try{
     if(mode==='gen'){
-      const {joints, backendId}=await requestGenerate(text);
-      loadClip(joints);
-      resetHistory(text, joints, backendId);   // 重新 gen → 清空歷史，新 root(保留為 source)
+      const clip=await requestGenerate(text);
+      loadClip(clip);
+      resetHistory(text, clip, clip.backendId);   // 重新 gen → 清空歷史，新 root(保留為 source)
     }else{
-      const node=nodes.find(x=>x.id===curId);  // 以目前節點為 source（後端用 backendId 取回保留的 source token）
-      const {joints, backendId}=await requestEdit(node, text);
-      loadClip(joints);
-      addEdit(text, joints, backendId);        // 編輯 → 在目前節點下長出分支
+      const node=nodes.find(x=>x.id===curId);      // 以目前節點為 source（後端用 backendId 取回保留的 source token）
+      const clip=await requestEdit(node, text);
+      loadClip(clip);
+      addEdit(text, clip, clip.backendId);         // 編輯 → 在目前節點下長出分支
     }
     promptEl.value='';
   }catch(e){ flash('後端未連線 · 目前為 mock 模式'); console.error(e); }
@@ -514,7 +576,7 @@ function flash(msg){ loadTxt.textContent=msg; loadEl.classList.add('show'); setT
 // playback controls
 const playBtn=document.getElementById('playBtn'), scrub=document.getElementById('scrub');
 playBtn.onclick=()=>{ playing=!playing; playBtn.textContent=playing?'⏸':'▶'; };
-scrub.oninput=()=>{ if(!clip)return; playing=false; playBtn.textContent='▶'; fIdx=+scrub.value; poseFigure(clip[fIdx]);
+scrub.oninput=()=>{ if(!clip)return; playing=false; playBtn.textContent='▶'; fIdx=+scrub.value; setFrame(fIdx);
   document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; };
 document.querySelectorAll('.spd button').forEach(b=>b.onclick=()=>{ speed=+b.dataset.s;
   document.querySelectorAll('.spd button').forEach(x=>x.classList.toggle('act',x===b)); });
@@ -528,6 +590,7 @@ bindP('p_ts','v_ts',v=>v);
 bindP('p_gs','v_gs',v=>(+v).toFixed(1));
 bindP('p_es','v_es',v=>(+v).toFixed(1));
 bindP('p_ss','v_ss',v=>(+v).toFixed(2));
+bindP('p_sk','v_sk',v=>(+v).toFixed(2));
 bindP('p_tp','v_tp',v=>(+v).toFixed(1));
 bindP('p_tk','v_tk',v=>(+v).toFixed(2));
 bindP('p_ln','v_ln',v=>v+'f');

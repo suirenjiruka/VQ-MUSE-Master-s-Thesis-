@@ -278,7 +278,7 @@ def motion_to_proxy_vertices(motion_denorm, target_joints, smpl_model, vis_cfg, 
     return vertices.reshape(b, t, vertices.shape[1], 3)[0], before_error, after_error
 
 
-def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=None):
+def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=None, init_pose=None):
     from utils.SMPL_handle import joints2smpl
     from utils.rotation2xyz import Rotation2xyz
 
@@ -289,6 +289,9 @@ def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=No
     if sample_ids[-1].item() != total_frames - 1:
         sample_ids = torch.cat([sample_ids, torch.tensor([total_frames - 1], device=joints.device)])
     sampled_joints = joints.index_select(0, sample_ids)
+    sampled_init = None
+    if init_pose is not None:
+        sampled_init = init_pose[:total_frames].index_select(0, sample_ids.to(init_pose.device))
 
     fit_name = f" {label}" if label else ""
     print(f"[smpl-fit]{fit_name}: fitting {sampled_joints.shape[0]}/{total_frames} frames "
@@ -298,7 +301,7 @@ def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=No
     visual_cfg.smpl_fit_iters = int(getattr(vis_cfg, "smpl_fit_iters", getattr(visual_cfg, "smpl_fit_iters", 150)))
     j2s = joints2smpl(visual_cfg, num_frames=scaled_joints.shape[0], device=device, cuda=(device.type == "cuda"))
     rot2xyz = Rotation2xyz(visual_cfg, device=device)
-    motion_tensor, opt_dict = j2s(scaled_joints)
+    motion_tensor, opt_dict = j2s(scaled_joints, init_pose=sampled_init)
     vertices = rot2xyz(
         torch.as_tensor(motion_tensor, dtype=torch.float32, device=device).clone(),
         mask=None,

@@ -803,6 +803,7 @@ class VAMotion(nn.Module):
                  cond_scale: int,
                  source_cond_scale=None,   # dual CFG: preservation strength; None -> 1.0
                  source_m_lens=None,       # source len
+                 source_keep_ratio=0.0,    # dynamic in-painting: 鎖住這比例的 source token 當畫布(0=關閉)
                  temperature=1,
                  topk_filter_thres=0.95,
                  gsample=False):   #borrow from SnapMogen
@@ -848,6 +849,15 @@ class VAMotion(nn.Module):
         scores = torch.where(padding_mask, 1e4, 0.0)
         starting_temperature = temperature
 
+        # dynamic source in-painting: 鎖住一部分 source token 當畫布，模型只重畫其餘 → 輸出貼著來源動作。
+        # 純推論(不需重訓)：BERT 式訓練本就會「給定可見 token 補齊其餘」，鎖住的 token 全程當可見脈絡。
+        keep_mask = torch.zeros_like(ids, dtype=torch.bool)
+        if source_keep_ratio and source_keep_ratio > 0:
+            r = torch.rand_like(ids, dtype=torch.float)
+            keep_mask = (r < float(source_keep_ratio)) & non_padding_mask & has_source
+            ids = torch.where(keep_mask, source_ids, ids)
+            scores = torch.where(keep_mask, torch.full_like(scores, 1e4), scores)
+
         for timestep in torch.linspace(0, 1, timesteps, device=device):
             # 0 < timestep < 1
             rand_mask_prob = self.noise_schedule(timestep)  # Tensor
@@ -862,6 +872,7 @@ class VAMotion(nn.Module):
             sorted_indices = scores.argsort(dim=1)  # (b, k), sorted_indices[i, j] = the index of j-th lowest element in scores on dim=1
             ranks = sorted_indices.argsort(dim=1)  # (b, k), rank[i, j] = the rank (0: lowest) of scores[i, j] on dim=1
             is_mask = (ranks < num_token_masked.unsqueeze(-1))
+            is_mask = is_mask & (~keep_mask)          # 鎖住的 source token 永不重新遮罩
             ids = torch.where(is_mask, self.mask_id, ids)
 
             '''

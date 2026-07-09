@@ -19,9 +19,9 @@ num_workers: 0
 # Sampling params
 time_steps: [10]
 cond_scales: [2]       # legacy fallback if task-specific scales are absent
-gen_cond_scales: [4]   # matches training Gen Eval
-edit_cond_scales: [2]  # matches training MotionEdit Eval
-source_cond_scale: 1  # legacy, no-op for text-only CFG
+gen_cond_scales: [3]   # matches training Gen Eval
+edit_cond_scales: [1.75]  # matches training MotionEdit Eval
+source_cond_scale: 1.2
 source_hint_ratio: 0.2
 temperature: 1
 topkr: 0.95
