@@ -1,0 +1,539 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VAMotion · 互動展示</title>
+<style>
+  :root{
+    --bg:#0c0f13; --panel:#12161c; --panel2:#161c24; --line:#232b35;
+    --ink:#e8eef4; --muted:#8a97a5; --accent:#2fb6c4; --accent-d:#1c8794;
+    --edit:#e0954a; --gen:#5fce8e; --danger:#e05a5a;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang TC","Microsoft JhengHei",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:var(--sans);overflow:hidden}
+  #app{position:fixed;inset:0}
+  #scene{position:absolute;inset:0}
+  canvas{display:block;outline:none}
+
+  /* top badge */
+  .brand{position:absolute;top:18px;left:20px;z-index:5;display:flex;align-items:center;gap:10px;
+    pointer-events:none}
+  .brand .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 12px var(--accent)}
+  .brand b{font-weight:640;letter-spacing:.02em}
+  .brand span{font-family:var(--mono);font-size:11px;color:var(--muted)}
+
+  /* mode + status pill */
+  .status{position:absolute;top:16px;left:50%;transform:translateX(-50%);z-index:5;
+    display:flex;gap:8px;align-items:center}
+  .pill{font-family:var(--mono);font-size:11px;padding:5px 11px;border-radius:20px;border:1px solid var(--line);
+    background:var(--panel);color:var(--muted)}
+  .pill.on-gen{color:var(--gen);border-color:var(--gen)}
+  .pill.on-edit{color:var(--edit);border-color:var(--edit)}
+
+  /* right history panel */
+  #history{position:absolute;top:0;right:0;bottom:0;width:300px;z-index:4;
+    background:linear-gradient(180deg,var(--panel),var(--panel2));border-left:1px solid var(--line);
+    display:flex;flex-direction:column}
+  #history h3{margin:0;padding:16px 18px 10px;font-size:12px;font-family:var(--mono);letter-spacing:.12em;
+    text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  #history h3 em{font-style:normal;color:var(--edit);font-size:11px}
+  #graph{flex:1;overflow-y:auto;position:relative;padding:6px 0}
+  #gInner{position:relative;min-height:100%}
+  .empty-h{color:var(--muted);font-size:13px;text-align:center;padding:40px 24px;line-height:1.6}
+  .node{position:absolute;display:flex;align-items:center;gap:9px;cursor:pointer;
+    padding:5px 10px;border-radius:8px;transition:background .12s}
+  .node:hover{background:rgba(255,255,255,.04)}
+  .node .glyph{width:14px;height:14px;border-radius:50%;border:2px solid var(--edit);background:var(--panel);flex:none}
+  .node.root .glyph{border-color:var(--gen)}
+  .node.cur .glyph{background:var(--edit);box-shadow:0 0 10px var(--edit)}
+  .node.root.cur .glyph{background:var(--gen);box-shadow:0 0 10px var(--gen)}
+  .node .txt{font-size:12.5px;line-height:1.25;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .node .txt small{display:block;font-family:var(--mono);font-size:10px;color:var(--muted)}
+  #edges{position:absolute;inset:0;pointer-events:none}
+
+  /* bottom control bar */
+  #bar{position:absolute;left:0;right:300px;bottom:0;z-index:5;padding:16px 22px 20px;
+    display:flex;flex-direction:column;gap:12px;
+    background:linear-gradient(0deg,rgba(10,12,15,.92),rgba(10,12,15,0))}
+  .row{display:flex;gap:12px;align-items:center;max-width:760px;margin:0 auto;width:100%}
+  .toggle{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;flex:none}
+  .toggle button{background:none;border:none;color:var(--muted);font-family:var(--mono);font-size:12px;
+    padding:9px 15px;cursor:pointer;transition:.14s}
+  .toggle button.act[data-m="gen"]{background:var(--gen);color:#08130c}
+  .toggle button.act[data-m="edit"]{background:var(--edit);color:#1a1206}
+  .inp{flex:1;display:flex;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    align-items:center;padding:4px 4px 4px 16px;transition:border-color .15s}
+  .inp:focus-within{border-color:var(--accent)}
+  .inp input{flex:1;background:none;border:none;color:var(--ink);font-size:15px;font-family:var(--sans);padding:11px 0;outline:none}
+  .inp input::placeholder{color:var(--muted)}
+  .send{background:var(--accent);color:#04222a;border:none;border-radius:9px;font-weight:640;
+    padding:10px 18px;cursor:pointer;font-size:14px;transition:.14s}
+  .send:hover{background:var(--accent-d);color:#fff}
+  .send:disabled{opacity:.5;cursor:not-allowed}
+
+  /* playback */
+  .play{display:flex;gap:12px;align-items:center;max-width:760px;margin:0 auto;width:100%;
+    color:var(--muted);font-family:var(--mono);font-size:11px}
+  .play button{background:var(--panel);border:1px solid var(--line);color:var(--ink);width:34px;height:30px;
+    border-radius:8px;cursor:pointer;font-size:13px}
+  .play input[type=range]{flex:1;accent-color:var(--accent)}
+  .play .spd{display:flex;gap:5px}
+  .play .spd button{width:auto;padding:0 9px;font-family:var(--mono);font-size:11px}
+  .play .spd button.act{border-color:var(--accent);color:var(--accent)}
+
+  /* loading */
+  #load{position:absolute;inset:0;z-index:8;display:none;align-items:center;justify-content:center;
+    flex-direction:column;gap:16px;background:rgba(8,10,13,.55);backdrop-filter:blur(2px)}
+  #load.show{display:flex}
+  .spin{width:38px;height:38px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;
+    animation:sp 0.8s linear infinite}
+  #load p{font-family:var(--mono);font-size:13px;color:var(--muted)}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  @media (prefers-reduced-motion:reduce){.spin{animation-duration:2s}}
+
+  .pill.be-on{color:var(--gen);border-color:var(--gen)}
+  .pill.be-off{color:var(--muted)}
+
+  /* param panel */
+  #paramWrap{position:absolute;top:52px;left:20px;z-index:6;width:230px}
+  #paramBtn{width:100%;text-align:left;background:var(--panel);border:1px solid var(--line);color:var(--ink);
+    font-family:var(--mono);font-size:12px;padding:8px 12px;border-radius:9px;cursor:pointer}
+  #paramBtn:hover{border-color:var(--accent)}
+  #params{margin-top:8px;background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:12px 14px;
+    display:flex;flex-direction:column;gap:11px}
+  #params.hidden{display:none}
+  #params label{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  #params label b{color:var(--accent);font-weight:600;float:right}
+  #params input[type=range]{accent-color:var(--accent);width:100%}
+  #params label.chk{flex-direction:row;align-items:center;gap:8px;color:var(--ink);font-size:12px}
+  #params label.chk input{accent-color:var(--accent)}
+
+  .hint{position:absolute;bottom:8px;left:22px;z-index:5;font-family:var(--mono);font-size:10.5px;color:#4a5563;pointer-events:none}
+</style>
+<script type="importmap">
+{ "imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="app">
+  <div id="scene"></div>
+
+  <div class="brand"><span class="dot"></span><b>VAMotion</b><span>互動展示 · best.tar</span></div>
+  <div class="status">
+    <span class="pill" id="backendPill">偵測後端…</span>
+    <span class="pill" id="modePill">模式：生成</span>
+    <span class="pill" id="framePill">— frames</span>
+  </div>
+
+  <div id="paramWrap">
+    <button id="paramBtn">⚙ 推論參數</button>
+    <div id="params" class="hidden">
+      <label>Time steps <b id="v_ts">10</b><input type="range" id="p_ts" min="1" max="30" step="1" value="10"></label>
+      <label>Gen scale <b id="v_gs">2.0</b><input type="range" id="p_gs" min="0" max="8" step="0.5" value="2"></label>
+      <label>Edit scale <b id="v_es">2.0</b><input type="range" id="p_es" min="0" max="8" step="0.5" value="2"></label>
+      <label>Source scale <b id="v_ss">1.0</b><input type="range" id="p_ss" min="0" max="4" step="0.25" value="1"></label>
+      <label>Temperature <b id="v_tp">1.0</b><input type="range" id="p_tp" min="0.1" max="2" step="0.1" value="1"></label>
+      <label>Top-k thres <b id="v_tk">0.95</b><input type="range" id="p_tk" min="0.5" max="1" step="0.05" value="0.95"></label>
+      <label>Gen length <b id="v_ln">120f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="120"></label>
+      <label class="chk"><input type="checkbox" id="p_gum" checked> Gumbel sampling</label>
+    </div>
+  </div>
+
+  <aside id="history">
+    <h3>編輯歷史 <em id="branchTag">git branches</em></h3>
+    <div id="graph">
+      <div id="gInner"><svg id="edges"></svg></div>
+      <div class="empty-h" id="emptyH">先在下方輸入描述生成一段動作，<br>之後的每次編輯會在這裡長出分支。</div>
+    </div>
+  </aside>
+
+  <div id="bar">
+    <div class="play" id="playCtl" style="visibility:hidden">
+      <button id="playBtn" title="播放/暫停">⏸</button>
+      <input type="range" id="scrub" min="0" max="100" value="0">
+      <span id="tlabel">0.0s</span>
+      <span class="spd">
+        <button data-s="0.5">0.5×</button>
+        <button data-s="1" class="act">1×</button>
+        <button data-s="2">2×</button>
+      </span>
+    </div>
+    <div class="row">
+      <div class="toggle" id="modeToggle">
+        <button data-m="gen" class="act">生成 Gen</button>
+        <button data-m="edit">編輯 Edit</button>
+      </div>
+      <div class="inp">
+        <input id="prompt" type="text" placeholder="描述一段動作，例如：a person walks forward and waves" autocomplete="off">
+      </div>
+      <button class="send" id="send">送出</button>
+    </div>
+  </div>
+
+  <div id="load"><div class="spin"></div><p id="loadTxt">生成中…</p></div>
+  <div class="hint">拖曳左鍵旋轉 · 右鍵/雙指平移 · 滾輪縮放</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ============================================================
+   1. 3D SCENE  (拖曳旋轉 + 平移 + 縮放)
+============================================================ */
+const host = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ antialias:true });
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+host.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0c0f13);
+scene.fog = new THREE.Fog(0x0c0f13, 6, 22);
+
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+camera.position.set(2.6, 1.7, 4.2);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.dampingFactor = 0.08;
+controls.enablePan = true;                 // 移動位置
+controls.target.set(0, 0.95, 0);
+controls.minDistance = 1.5; controls.maxDistance = 16;
+controls.maxPolarAngle = Math.PI*0.92;
+
+// lighting
+scene.add(new THREE.HemisphereLight(0x9fd4ff, 0x1a2028, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 2.1);
+key.position.set(4,7,3); key.castShadow = true;
+key.shadow.mapSize.set(2048,2048); key.shadow.bias = -0.0003;
+key.shadow.camera.left=-4; key.shadow.camera.right=4; key.shadow.camera.top=4; key.shadow.camera.bottom=-4;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0x2fb6c4, 0.9); rim.position.set(-5,3,-4); scene.add(rim);
+
+// ground
+const ground = new THREE.Mesh(
+  new THREE.CircleGeometry(14, 64),
+  new THREE.MeshStandardMaterial({ color:0x11161d, roughness:0.95, metalness:0.0 })
+);
+ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
+const grid = new THREE.GridHelper(20, 40, 0x2a3540, 0x1a222b);
+grid.material.opacity = 0.5; grid.material.transparent = true; scene.add(grid);
+
+function resize(){
+  const w = host.clientWidth, h = host.clientHeight;
+  renderer.setSize(w,h); camera.aspect = w/h; camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(host); resize();
+
+/* ============================================================
+   2. HUMANOID  (22-joint SMPL skeleton → capsule mesh)
+============================================================ */
+const PARENT = [-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19];
+const BONE = i => PARENT[i];
+
+// unified skin material → reads as one continuous body mesh, not a wire skeleton
+const skinMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.6, metalness:0.05 });
+// per-part radii (thick torso, tapered limbs) so the capsules+joint fillers form a solid mannequin
+const RB = {3:.115,6:.125,9:.115, 1:.085,2:.085,4:.078,5:.078,7:.062,8:.062,10:.05,11:.05,
+            12:.055,13:.08,14:.08,15:.062, 16:.072,17:.072,18:.058,19:.058,20:.046,21:.046};
+const RJ = {0:.125,3:.11,6:.12,9:.11, 1:.085,2:.085,4:.076,5:.076,7:.06,8:.06,10:.05,11:.05,
+            12:.06,13:.072,14:.072,15:.125, 16:.072,17:.072,18:.056,19:.056,20:.05,21:.05};
+
+const figure = new THREE.Group(); figure.visible = false; scene.add(figure);  // 起始空場景，生成後才顯示
+const jointMeshes = [], boneMeshes = [];
+for(let i=0;i<22;i++){
+  const r = RJ[i] ?? 0.05;
+  const s = new THREE.Mesh(new THREE.SphereGeometry(r, 22, 18), skinMat);   // gap-filler at each joint
+  s.castShadow = true; figure.add(s); jointMeshes.push(s);
+}
+for(let i=1;i<22;i++){
+  const r = RB[i] ?? 0.05;
+  const c = new THREE.Mesh(new THREE.CapsuleGeometry(r, 1, 8, 16), skinMat); // limb / torso volume
+  c.castShadow = true; figure.add(c); boneMeshes.push({mesh:c, j:i, p:BONE(i), r});
+}
+
+const _a=new THREE.Vector3(),_b=new THREE.Vector3(),_m=new THREE.Vector3(),_d=new THREE.Vector3(),_up=new THREE.Vector3(0,1,0),_q=new THREE.Quaternion();
+function poseFigure(joints){ // joints: Array(22) of [x,y,z]
+  for(let i=0;i<22;i++) jointMeshes[i].position.set(joints[i][0],joints[i][1],joints[i][2]);
+  for(const b of boneMeshes){
+    _a.fromArray(joints[b.p]); _b.fromArray(joints[b.j]);
+    _m.addVectors(_a,_b).multiplyScalar(0.5); b.mesh.position.copy(_m);
+    _d.subVectors(_b,_a); const len=_d.length();
+    b.mesh.scale.set(1, Math.max(len - b.r*1.4, 0.02), 1);   // radius baked in geometry; scale length only
+    _d.normalize(); _q.setFromUnitVectors(_up,_d); b.mesh.quaternion.copy(_q);
+  }
+}
+
+/* ============================================================
+   3. MOCK MOTION MODEL   ←←← 之後在這裡接真後端 (best.tar)
+   產出的資料格式 = frames[F][22][3] (世界座標關節點)，與 HumanML3D 一致。
+============================================================ */
+const REST = [
+  [0,0.95,0],[0.09,0.89,0],[-0.09,0.89,0],[0,1.07,0],[0.10,0.49,0.02],[-0.10,0.49,0.02],
+  [0,1.20,0],[0.10,0.09,0.0],[-0.10,0.09,0.0],[0,1.33,0],[0.10,0.03,0.13],[-0.10,0.03,0.13],
+  [0,1.52,0],[0.05,1.44,0],[-0.05,1.44,0],[0,1.70,0],[0.17,1.46,0],[-0.17,1.46,0],
+  [0.20,1.18,0.02],[-0.20,1.18,0.02],[0.21,0.94,0.03],[-0.21,0.94,0.03]
+];
+function hash(s){let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619);}return (h>>>0);}
+function textToParams(text){
+  const t=text.toLowerCase(), r=hash(text);
+  const rnd=(a,b)=>a+((r>>((a*7)%20))&255)/255*(b-a);
+  let p={speed:1.0, legSwing:0.7, armSwing:0.6, bob:0.05, twist:0.15, lift:0, jump:0, forward:0.0, frames:120};
+  if(/wav|揮|hello|hi\b/.test(t)) p.armSwing=1.4, p.wave=true;
+  if(/run|跑|sprint/.test(t)) p.speed=1.9, p.legSwing=1.2, p.bob=0.09, p.forward=0.02;
+  if(/walk|走|forward/.test(t)) p.forward=0.014;
+  if(/jump|跳|hop/.test(t)) p.jump=0.35, p.speed=1.3;
+  if(/kick|踢/.test(t)) p.legSwing=1.6, p.kick=true;
+  if(/dance|舞|spin|turn|轉/.test(t)) p.twist=0.9, p.armSwing=1.1;
+  if(/sit|坐|crouch|蹲/.test(t)) p.lift=-0.25, p.legSwing=0.2;
+  p.speed*= rnd(0.9,1.15); p.phase=(r%628)/100;
+  return p;
+}
+function rotX(v,c,a){const s=Math.sin(a),co=Math.cos(a),y=v[1]-c[1],z=v[2]-c[2];return [v[0],c[1]+y*co-z*s,c[2]+y*s+z*co];}
+function rotY(v,c,a){const s=Math.sin(a),co=Math.cos(a),x=v[0]-c[0],z=v[2]-c[2];return [c[0]+x*co+z*s,v[1],c[2]-x*s+z*co];}
+function synth(p){
+  const F=p.frames, out=[];
+  for(let f=0;f<F;f++){
+    const ph=p.phase + f/F*Math.PI*2*2*p.speed;
+    const J=REST.map(v=>v.slice());
+    const bob=Math.sin(ph*2)*p.bob + (p.lift||0);
+    for(let i=0;i<22;i++){ J[i][1]+=bob; }
+    if(p.jump){ const jj=Math.max(0,Math.sin(ph))*p.jump; for(let i=0;i<22;i++)J[i][1]+=jj; }
+    // legs (rotate hip subtree about hip X)
+    const swing=Math.sin(ph)*p.legSwing;
+    const legL=[4,7,10], legR=[5,8,11];
+    legL.forEach(i=>J[i]=rotX(J[i],J[1], swing));
+    legR.forEach(i=>J[i]=rotX(J[i],J[2],-swing));
+    // knees bend on back-swing
+    [7,10].forEach(i=>J[i]=rotX(J[i],J[4],Math.max(0,-swing)*0.9));
+    [8,11].forEach(i=>J[i]=rotX(J[i],J[5],Math.max(0, swing)*0.9));
+    // arms (opposite phase)
+    const aL=[18,20], aR=[19,21];
+    if(p.wave){ aL.forEach(i=>J[i]=rotX(J[i],J[16], -1.9 + Math.sin(ph*4)*0.4)); }
+    else aL.forEach(i=>J[i]=rotX(J[i],J[16], -swing*p.armSwing));
+    aR.forEach(i=>J[i]=rotX(J[i],J[17], swing*p.armSwing));
+    // spine twist / turn
+    if(p.twist){ const up=[3,6,9,12,13,14,15,16,17,18,19,20,21]; up.forEach(i=>J[i]=rotY(J[i],J[0], Math.sin(ph)*p.twist)); }
+    // forward travel
+    const tz=-(f/F)*p.forward*F; for(let i=0;i<22;i++)J[i][2]+=tz;
+    out.push(J);
+  }
+  return out;
+}
+/* ---- backend bridge：偵測得到 server.py 就用真 model，否則自動退回 mock ---- */
+const API = 'http://localhost:5000';
+let backendOk = false;
+async function pingBackend(){
+  try{ const r=await fetch(API+'/health',{signal:AbortSignal.timeout(1500)}); backendOk=r.ok; }
+  catch{ backendOk=false; }
+  const pill=document.getElementById('backendPill');
+  pill.textContent = backendOk ? '後端已連線 · best.tar' : 'mock 模式（未連後端）';
+  pill.className = 'pill '+(backendOk?'be-on':'be-off');
+  return backendOk;
+}
+function normalizeJoints(frames){  // 落地(最低點→y=0) + 起點 XZ 置中，保留行走位移
+  let minY=Infinity;
+  for(const f of frames) for(const j of f) if(j[1]<minY) minY=j[1];
+  const r0=frames[0][0];
+  return frames.map(fr=>fr.map(j=>[j[0]-r0[0], j[1]-minY, j[2]-r0[2]]));
+}
+function readParams(mode){
+  const g=id=>+document.getElementById(id).value;
+  return { time_steps:g('p_ts'),
+    cond_scale: mode==='gen'? g('p_gs') : g('p_es'),   // gen scale / edit scale
+    source_scale:g('p_ss'), temperature:g('p_tp'), topk:g('p_tk'),
+    gumbel:document.getElementById('p_gum').checked, length:g('p_ln') };
+}
+
+async function requestGenerate(text){
+  const p=readParams('gen');
+  if(backendOk){
+    const r=await fetch(API+'/generate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text, length:p.length, params:p})});
+    if(!r.ok) throw new Error('generate '+r.status);
+    const d=await r.json(); fps=d.fps||fps;
+    return { joints:normalizeJoints(d.joints), backendId:d.id };
+  }
+  await sleep(500); return { joints:synth(textToParams(text)), backendId:null };
+}
+async function requestEdit(node, text){
+  const p=readParams('edit');
+  if(backendOk && node.backendId){
+    const r=await fetch(API+'/edit',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({source_id:node.backendId, text, params:p})});
+    if(!r.ok) throw new Error('edit '+r.status);
+    const d=await r.json(); fps=d.fps||fps;
+    return { joints:normalizeJoints(d.joints), backendId:d.id };
+  }
+  await sleep(500); return { joints:mockEdit(node.motion, text), backendId:null };
+}
+function mockEdit(sourceMotion, text){
+  const t=text.toLowerCase(); const src=sourceMotion; const F=src.length;
+  let out=src.map(fr=>fr.map(j=>j.slice()));
+  if(/slow|慢|slower/.test(t)) out=resample(src, 1.6);
+  else if(/fast|快|faster|quick/.test(t)) out=resample(src, 0.6);
+  if(/mirror|鏡|swap.*hand|對稱/.test(t)) out=out.map(fr=>fr.map(j=>[-j[0],j[1],j[2]]));
+  if(/reverse|倒|backward/.test(t)) out=out.slice().reverse();
+  if(/rais|抬|higher|舉高|arm/.test(t)) out=out.map(fr=>{const g=fr.map(j=>j.slice());[18,19,20,21].forEach(i=>g[i]=rotX(g[i],g[16],-0.9));return g;});
+  if(/jump|跳|hop/.test(t)) out=out.map((fr,f)=>{const j=Math.abs(Math.sin(f/F*Math.PI*4))*0.3;return fr.map(p=>[p[0],p[1]+j,p[2]]);});
+  return out;
+}
+function resample(m, factor){
+  const F=Math.max(8,Math.round(m.length*factor)), out=[];
+  for(let f=0;f<F;f++){ const s=f/(F-1)*(m.length-1), i=Math.floor(s), a=s-i, n=Math.min(i+1,m.length-1);
+    out.push(m[i].map((j,k)=>j.map((v,c)=>v*(1-a)+m[n][k][c]*a))); }
+  return out;
+}
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+/* ============================================================
+   4. PLAYER
+============================================================ */
+let clip=null, fIdx=0, playing=true, speed=1, fps=20, acc=0;
+function loadClip(motion){
+  clip=motion; fIdx=0; acc=0; playing=true; playBtn.textContent='⏸';
+  figure.visible=true;                 // 首次生成 → 顯示角色
+  poseFigure(clip[0]);
+  document.getElementById('playCtl').style.visibility='visible';
+  document.getElementById('scrub').max=clip.length-1;
+  document.getElementById('framePill').textContent=`${clip.length} frames · ${(clip.length/fps).toFixed(1)}s`;
+}
+const clock=new THREE.Clock();
+function tick(){
+  requestAnimationFrame(tick);
+  const dt=clock.getDelta();
+  if(clip && playing){
+    acc+=dt*speed*fps;
+    if(acc>=1){ fIdx=(fIdx+Math.floor(acc))%clip.length; acc%=1; poseFigure(clip[fIdx]);
+      document.getElementById('scrub').value=fIdx;
+      document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; }
+  }
+  controls.update(); renderer.render(scene,camera);
+}
+tick();
+
+/* ============================================================
+   5. HISTORY TREE  (git-style branches)
+============================================================ */
+let nodes=[], curId=null, nid=0;
+function makeNode(text, motion, parentId, isRoot, backendId){
+  const n={id:nid++, text, motion, backendId:backendId||null, parent:parentId, children:[], root:!!isRoot};
+  nodes.push(n);
+  if(parentId!=null){ const p=nodes.find(x=>x.id===parentId); p&&p.children.push(n.id); }
+  return n;
+}
+function resetHistory(rootText, motion, backendId){ nodes=[]; nid=0; const r=makeNode(rootText,motion,null,true,backendId); curId=r.id; renderGraph(); }
+function addEdit(text, motion, backendId){ const n=makeNode(text,motion,curId,false,backendId); curId=n.id; renderGraph(); }
+
+const graphEl=document.getElementById('gInner'), edgesEl=document.getElementById('edges'), emptyH=document.getElementById('emptyH');
+function renderGraph(){
+  graphEl.querySelectorAll('.node').forEach(e=>e.remove());
+  if(!nodes.length){ emptyH.style.display='block'; edgesEl.innerHTML=''; return; }
+  emptyH.style.display='none';
+  // lane layout: DFS pre-order rows; first child keeps lane, others get new lane
+  const rows=[]; let nextLane=0; const laneOf={};
+  (function dfs(id,lane){ laneOf[id]=lane; rows.push(id);
+    const c=nodes.find(x=>x.id===id).children;
+    c.forEach((cid,k)=> dfs(cid, k===0?lane:++nextLane));
+  })(nodes.find(n=>n.root).id, 0);
+  const rowH=46, colW=26, x0=20, y0=14;
+  const pos={};
+  rows.forEach((id,r)=>{ pos[id]={x:x0+laneOf[id]*colW, y:y0+r*rowH}; });
+  graphEl.style.height=(y0+rows.length*rowH+20)+'px';
+  // edges
+  let paths='';
+  nodes.forEach(n=>{ if(n.parent!=null){ const a=pos[n.parent],b=pos[n.id];
+    paths+=`<path d="M${a.x} ${a.y} C ${a.x} ${(a.y+b.y)/2}, ${b.x} ${(a.y+b.y)/2}, ${b.x} ${b.y}" fill="none" stroke="#2c3946" stroke-width="2"/>`; }});
+  edgesEl.setAttribute('width', graphEl.clientWidth); edgesEl.setAttribute('height', graphEl.style.height);
+  edgesEl.innerHTML=paths;
+  // nodes
+  rows.forEach(id=>{ const n=nodes.find(x=>x.id===id), p=pos[id];
+    const el=document.createElement('div');
+    el.className='node'+(n.root?' root':'')+(id===curId?' cur':'');
+    el.style.left=(p.x-6)+'px'; el.style.top=(p.y-14)+'px';
+    el.innerHTML=`<span class="glyph"></span><span class="txt">${escapeHtml(n.text)}<small>${n.root?'GEN · source':'edit #'+n.id}</small></span>`;
+    el.onclick=()=>selectNode(id);
+    graphEl.appendChild(el);
+  });
+}
+function selectNode(id){ curId=id; const n=nodes.find(x=>x.id===id); loadClip(n.motion); renderGraph();
+  setMode('edit');  // 選了歷史節點 → 準備以它為 source 編輯
+  document.getElementById('prompt').placeholder=`編輯「${n.text.slice(0,18)}…」— 例如 slower / mirror / raise arms`;
+}
+function escapeHtml(s){return s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+/* ============================================================
+   6. UI WIRING
+============================================================ */
+let mode='gen';
+const modeToggle=document.getElementById('modeToggle'), modePill=document.getElementById('modePill'), promptEl=document.getElementById('prompt'), sendBtn=document.getElementById('send'), loadEl=document.getElementById('load'), loadTxt=document.getElementById('loadTxt');
+function setMode(m){
+  mode=m;
+  modeToggle.querySelectorAll('button').forEach(b=>b.classList.toggle('act', b.dataset.m===m));
+  modePill.textContent = m==='gen'?'模式：生成':'模式：編輯';
+  modePill.className='pill '+(m==='gen'?'on-gen':'on-edit');
+  if(m==='gen') promptEl.placeholder='生成新動作（會清空編輯歷史）— a person walks and waves';
+  else if(!curId&&curId!==0) promptEl.placeholder='先生成一段動作，才能進入編輯';
+}
+modeToggle.querySelectorAll('button').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+
+async function run(){
+  const text=promptEl.value.trim(); if(!text) return;
+  if(mode==='edit' && curId==null && curId!==0){ flash('請先生成一段動作再編輯'); return; }
+  sendBtn.disabled=true; loadEl.classList.add('show');
+  loadTxt.textContent = mode==='gen' ? '生成動作中…' : '套用編輯中…';
+  try{
+    if(mode==='gen'){
+      const {joints, backendId}=await requestGenerate(text);
+      loadClip(joints);
+      resetHistory(text, joints, backendId);   // 重新 gen → 清空歷史，新 root(保留為 source)
+    }else{
+      const node=nodes.find(x=>x.id===curId);  // 以目前節點為 source（後端用 backendId 取回保留的 source token）
+      const {joints, backendId}=await requestEdit(node, text);
+      loadClip(joints);
+      addEdit(text, joints, backendId);        // 編輯 → 在目前節點下長出分支
+    }
+    promptEl.value='';
+  }catch(e){ flash('後端未連線 · 目前為 mock 模式'); console.error(e); }
+  finally{ sendBtn.disabled=false; loadEl.classList.remove('show'); }
+}
+sendBtn.onclick=run;
+promptEl.addEventListener('keydown',e=>{ if(e.key==='Enter') run(); });
+
+function flash(msg){ loadTxt.textContent=msg; loadEl.classList.add('show'); setTimeout(()=>loadEl.classList.remove('show'),1100); }
+
+// playback controls
+const playBtn=document.getElementById('playBtn'), scrub=document.getElementById('scrub');
+playBtn.onclick=()=>{ playing=!playing; playBtn.textContent=playing?'⏸':'▶'; };
+scrub.oninput=()=>{ if(!clip)return; playing=false; playBtn.textContent='▶'; fIdx=+scrub.value; poseFigure(clip[fIdx]);
+  document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; };
+document.querySelectorAll('.spd button').forEach(b=>b.onclick=()=>{ speed=+b.dataset.s;
+  document.querySelectorAll('.spd button').forEach(x=>x.classList.toggle('act',x===b)); });
+
+// param panel wiring
+const paramBtn=document.getElementById('paramBtn'), paramsEl=document.getElementById('params');
+paramBtn.onclick=()=>paramsEl.classList.toggle('hidden');
+const bindP=(id,vid,fmt)=>{const el=document.getElementById(id),lab=document.getElementById(vid);
+  const upd=()=>lab.textContent=fmt(el.value); el.addEventListener('input',upd); upd();};
+bindP('p_ts','v_ts',v=>v);
+bindP('p_gs','v_gs',v=>(+v).toFixed(1));
+bindP('p_es','v_es',v=>(+v).toFixed(1));
+bindP('p_ss','v_ss',v=>(+v).toFixed(2));
+bindP('p_tp','v_tp',v=>(+v).toFixed(1));
+bindP('p_tk','v_tk',v=>(+v).toFixed(2));
+bindP('p_ln','v_ln',v=>v+'f');
+
+pingBackend(); setInterval(pingBackend, 8000);   // 偵測後端；沒起 server.py 就走 mock
+setMode('gen');   // 起始：空場景，等待第一次生成
+</script>
+</body>
+</html>
