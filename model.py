@@ -614,7 +614,7 @@ class VAMotion(nn.Module):
         return mask 
 
     def forward(self, target_input, source_input, text_input, m_lens, has_source, source_m_lens=None,
-                source_joints=None, target_joints=None, same_src_text=None, same_src_flag=None,
+                same_src_text=None, same_src_flag=None,
                 same_target_input=None, same_m_lens=None):
         # target/source input are both multi-scale VQ ids
         target_ids, target_mask, time_to_arrival_pe = self.prepare_motion_ids(target_input, m_lens)

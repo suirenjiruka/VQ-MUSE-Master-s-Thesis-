@@ -494,13 +494,10 @@ class Text_2D_MotionDataset(Text2MotionDataset):
 class HML3DMotionEditDataset(data.Dataset):
     def __init__(self, opt, mean, std, split_file, motionfix_start_id=400000, w_vectorizer=None):
         self.opt, self.mean, self.std = opt, mean, std
-        self.w_vectorizer = w_vectorizer
         self.max_motion_length = opt.max_motion_length
-        self.max_text_len = getattr(opt, "max_text_len", 20)
         self.unit_length = opt.unit_length
         self.motionfix_start_id = motionfix_start_id
         self.motion_dir = getattr(opt, "motion_dir", pjoin(opt.root_dir, "HumanML3D", "new_joint_vecs"))
-        self.joint_dir = getattr(opt, "joint_dir", pjoin(opt.root_dir, "HumanML3D", "new_joints"))
         self.text_dir = getattr(opt, "text_dir", pjoin(opt.root_dir, "HumanML3D", "texts"))
         self.data_dict, self.name_list = {}, []
         self.edit_meta = {}
@@ -513,22 +510,23 @@ class HML3DMotionEditDataset(data.Dataset):
 
             try:
                 motion = np.load(pjoin(self.motion_dir, name + ".npy"), allow_pickle=True)
-                joints = np.load(pjoin(self.joint_dir, name + ".npy"), allow_pickle=True)
             except Exception as e:
                 print(e)
                 continue
 
             if task_type == "editing":
-                motion, joints = motion.item(), joints.item()
+                motion = motion.item()
                 src_motion, tgt_motion = motion["source"], motion["target"]
-                src_joints, tgt_joints = joints["source"], joints["target"]
                 if len(tgt_motion) < 40 or len(tgt_motion) > self.max_motion_length:
                     continue
                 # source keeps own len
                 if len(src_motion) < 40 or len(src_motion) > self.max_motion_length:
                     continue
-                text = open(pjoin(self.text_dir, name + ".txt"), encoding="utf-8").read().strip().split("\n")[0].split("#")[0].strip()
-                self.data_dict[name] = (task_type, [{"caption": text, "tokens": None}], src_motion, tgt_motion, src_joints, tgt_joints, len(tgt_motion), 1)
+                text_data = self._read_edit_text_data(name)
+                if len(text_data) == 0:
+                    continue
+                text = text_data[0]["caption"]
+                self.data_dict[name] = (text_data, src_motion, tgt_motion, len(tgt_motion), 1)
                 self.edit_meta[name] = {
                     "src": self._array_hash(src_motion),
                     "tgt": self._array_hash(tgt_motion),
@@ -554,15 +552,15 @@ class HML3DMotionEditDataset(data.Dataset):
                             text_data.append({"caption": caption, "tokens": tokens})
                         else:
                             s, e = int(f_tag * 20), int(to_tag * 20)
-                            seg_motion, seg_joints = motion[s:e], joints[s:e]
+                            seg_motion = motion[s:e]
                             if len(seg_motion) < 40 or len(seg_motion) >= 200:
                                 continue
                             new_name = f"{name}_{line_id}"
-                            self.data_dict[new_name] = (task_type, [{"caption": caption, "tokens": tokens}], None, seg_motion, None, seg_joints, len(seg_motion), 0)
+                            self.data_dict[new_name] = ([{"caption": caption, "tokens": tokens}], None, seg_motion, len(seg_motion), 0)
                             self.name_list.append(new_name)
 
                 if len(text_data) > 0:
-                    self.data_dict[name] = (task_type, text_data, None, motion, None, joints, len(motion), 0)
+                    self.data_dict[name] = (text_data, None, motion, len(motion), 0)
                     self.name_list.append(name)
             except Exception as e:
                 print(e)
@@ -573,6 +571,21 @@ class HML3DMotionEditDataset(data.Dataset):
             n_hard = len(self.same_src_neg)
             print(f"Same-source hard negatives: {n_hard}/{len(self.edit_meta)} edit samples")
 
+    def _read_edit_text_data(self, name):
+        text_data = []
+        seen = set()
+        with open(pjoin(self.text_dir, name + ".txt"), encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                caption = line.split("#")[0].strip()
+                key = caption.lower()
+                if not caption or key in seen:
+                    continue
+                seen.add(key)
+                text_data.append({"caption": caption, "tokens": None})
+        return text_data
     def _array_hash(self, arr, decimals=3):
         # stable source/target content key
         arr = np.ascontiguousarray(np.round(np.asarray(arr, dtype=np.float64), decimals))
@@ -622,36 +635,9 @@ class HML3DMotionEditDataset(data.Dataset):
             motion = np.concatenate([motion, np.zeros((self.max_motion_length - len(motion), motion.shape[1]))], axis=0)
         return motion
 
-    def _pad_joints(self, joints):
-        if len(joints) < self.max_motion_length:
-            joints = np.concatenate([joints, np.zeros((self.max_motion_length - len(joints), joints.shape[1], joints.shape[2]))], axis=0)
-        return joints
-
-    def _text_to_eval_inputs(self, tokens):
-        if self.w_vectorizer is None or tokens is None:
-            word_embeddings = np.zeros((self.max_text_len + 2, 300), dtype=np.float32)
-            pos_one_hots = np.zeros((self.max_text_len + 2, 15), dtype=np.float32)
-            return word_embeddings, pos_one_hots, 0
-
-        if len(tokens) < self.max_text_len:
-            tokens = ["sos/OTHER"] + tokens + ["eos/OTHER"]
-            sent_len = len(tokens)
-            tokens = tokens + ["unk/OTHER"] * (self.max_text_len + 2 - sent_len)
-        else:
-            tokens = tokens[:self.max_text_len]
-            tokens = ["sos/OTHER"] + tokens + ["eos/OTHER"]
-            sent_len = len(tokens)
-
-        pos_one_hots, word_embeddings = [], []
-        for token in tokens:
-            word_emb, pos_oh = self.w_vectorizer[token]
-            pos_one_hots.append(pos_oh[None, :])
-            word_embeddings.append(word_emb[None, :])
-        return np.concatenate(word_embeddings, axis=0), np.concatenate(pos_one_hots, axis=0), sent_len
-
     def __getitem__(self, item):
         name = self.name_list[item]
-        task_type, text_list, src_motion, tgt_motion, src_joints, tgt_joints, m_length, has_source = self.data_dict[name]
+        text_list, src_motion, tgt_motion, m_length, has_source = self.data_dict[name]
         text_data = random.choice(text_list)
         caption = text_data["caption"]
         same_src_text = ""
@@ -661,18 +647,15 @@ class HML3DMotionEditDataset(data.Dataset):
             neg_name = random.choice(self.same_src_neg[name])
             same_src_text = self.edit_meta[neg_name]["text"]
             same_src_flag = 1
-        word_embeddings, pos_one_hots, sent_len = self._text_to_eval_inputs(text_data.get("tokens"))
 
         if has_source:
             # edit pair, keep full len
             m_length = (m_length // self.unit_length) * self.unit_length
             src_m_length = (len(src_motion) // self.unit_length) * self.unit_length
             tgt_motion = tgt_motion[:m_length]
-            tgt_joints = tgt_joints[:m_length]
             src_motion = src_motion[:src_m_length]
-            src_joints = src_joints[:src_m_length]
             if same_src_flag:
-                neg_tgt_motion = self.data_dict[neg_name][3]
+                neg_tgt_motion = self.data_dict[neg_name][2]
                 same_m_length = (len(neg_tgt_motion) // self.unit_length) * self.unit_length
                 same_tgt_motion = neg_tgt_motion[:same_m_length]
         else:
@@ -680,9 +663,7 @@ class HML3DMotionEditDataset(data.Dataset):
             m_length = self._crop_length(m_length)
             idx = random.randint(0, len(tgt_motion) - m_length)
             tgt_motion = tgt_motion[idx:idx + m_length]
-            tgt_joints = tgt_joints[idx:idx + m_length]
             src_motion = np.zeros_like(tgt_motion)
-            src_joints = np.zeros_like(tgt_joints)
             src_m_length = m_length
             same_m_length = m_length
 
@@ -695,7 +676,5 @@ class HML3DMotionEditDataset(data.Dataset):
 
         src_motion, tgt_motion = self._pad_motion(src_motion), self._pad_motion(tgt_motion)
         same_tgt_motion = self._pad_motion(same_tgt_motion)
-        src_joints, tgt_joints = self._pad_joints(src_joints), self._pad_joints(tgt_joints)
 
-        # append source len
-        return caption, src_motion, tgt_motion, m_length, src_joints, tgt_joints, has_source, task_type, name, word_embeddings, pos_one_hots, sent_len, src_m_length, same_src_text, same_src_flag, same_tgt_motion, same_m_length
+        return caption, src_motion, tgt_motion, m_length, has_source, src_m_length, same_src_text, same_src_flag, same_tgt_motion, same_m_length

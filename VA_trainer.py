@@ -205,16 +205,13 @@ class VA_motion_trainer:
 
     def forward(self, data_batch):
         # data fetch
-        caption, src_motion, tgt_motion, m_length, src_joints, tgt_joints, has_source, _task_type, _name = data_batch[:9]
-        src_m_length = data_batch[12]
-        same_src_text = data_batch[13] if len(data_batch) > 13 else None
-        same_src_flag = data_batch[14] if len(data_batch) > 14 else None
-        same_tgt_motion = data_batch[15] if len(data_batch) > 15 else None
-        same_m_length = data_batch[16] if len(data_batch) > 16 else None
+        caption, src_motion, tgt_motion, m_length, has_source, src_m_length = data_batch[:6]
+        same_src_text = data_batch[6] if len(data_batch) > 6 else None
+        same_src_flag = data_batch[7] if len(data_batch) > 7 else None
+        same_tgt_motion = data_batch[8] if len(data_batch) > 8 else None
+        same_m_length = data_batch[9] if len(data_batch) > 9 else None
         src_motion = src_motion.detach().float().to(self.device)
         tgt_motion = tgt_motion.detach().float().to(self.device)
-        src_joints = src_joints.detach().float().to(self.device)
-        tgt_joints = tgt_joints.detach().float().to(self.device)
         m_length = m_length.detach().long().to(self.device)
         src_m_length = src_m_length.detach().long().to(self.device)
         has_source = has_source.detach().long().to(self.device)
@@ -241,7 +238,7 @@ class VA_motion_trainer:
 
         _loss, loss_mt, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, _acc = self.training_model(
             target_code_idx, source_code_idx, caption, m_lens, has_source,
-            source_m_lens=src_m_lens, source_joints=src_joints, target_joints=tgt_joints,
+            source_m_lens=src_m_lens,
             same_src_text=same_src_text, same_src_flag=same_src_flag,
             same_target_input=same_target_code_idx, same_m_lens=same_m_lens
         )

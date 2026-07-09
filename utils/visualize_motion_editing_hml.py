@@ -156,7 +156,6 @@ def build_dataset(cfg, mean, std, split, motionfix_start_id):
     opt.max_motion_length = cfg.data.max_motion_length
     opt.unit_length = cfg.data.unit_length
     opt.motion_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joint_vecs")
-    opt.joint_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joints")
     opt.text_dir = pjoin(cfg.data.root_dir, "HumanML3D", "texts")
     split_file = pjoin(cfg.data.root_dir, "HumanML3D", f"{split}.txt")
     return HML3DMotionEditDataset(opt, mean, std, split_file, motionfix_start_id=motionfix_start_id)
@@ -167,7 +166,7 @@ def select_indices(dataset, mode, start_index, num_samples, random_select=False,
             "both": "all", "generation": "generation", "editing": "editing"}.get(mode, mode)
     selected = []
     for idx, name in enumerate(dataset.name_list):
-        task_type = dataset.data_dict[name][0]
+        task_type = "editing" if dataset.data_dict[name][4] else "generation"
         if mode != "all" and task_type != mode:
             continue
         selected.append(idx)
@@ -820,9 +819,9 @@ def add_labels(frame, caption, labels, frame_id, total_frames, vis_cfg=None):
 
 
 @torch.no_grad()
-def generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device):
-    caption, src_motion, tgt_motion, m_length, _, _, has_source, task_type, name = sample[:9]
-    src_m_length = sample[12] if len(sample) > 12 else m_length
+def generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device, name="sample"):
+    caption, src_motion, tgt_motion, m_length, has_source, src_m_length = sample[:6]
+    task_type = "editing" if has_source else "generation"
     src_motion_t = torch.from_numpy(src_motion).unsqueeze(0).to(device).float()
     tgt_motion_t = torch.from_numpy(tgt_motion).unsqueeze(0).to(device).float()
     m_length_t = torch.tensor([m_length], device=device).long()
@@ -1055,7 +1054,7 @@ def main():
     print(f"[visualize] selected_indices={indices}", flush=True)
     for idx in indices:
         sample = dataset[idx]
-        result = generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device)
+        result = generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device, name=dataset.name_list[idx])
         visualize_sample(result, cfg, vis_cfg, visual_cfg, mean, std, smpl_model, faces, device)
 
 
