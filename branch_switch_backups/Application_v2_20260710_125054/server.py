@@ -85,8 +85,6 @@ SMPL_STRIDE = int(os.environ.get("SMPL_STRIDE", "1"))
 WARM        = os.environ.get("WARM", "1") != "0"        # 用動作旋轉當初始姿勢(warm-start)
 LBS_POSE_BS = os.environ.get("LBS_POSE_BS", "1") != "0" # ① pose blendshape(補關節體積，實測有效)
 LBS_STRETCH = os.environ.get("LBS_STRETCH", "1") != "0" # ④ 沿骨軸伸縮(消關節縫隙)
-SMOOTH_WIN  = int(os.environ.get("SMOOTH_WIN", "2"))    # 關節時間平滑半徑(減少抖動；0=關)
-TAUBIN_ITERS= int(os.environ.get("TAUBIN_ITERS", "2"))  # 網格 Taubin 平滑迭代(減少表面扭曲/重疊觀感；0=關)
 NEED_SMPL = MESH_MODE in ("lbs", "own", "fit", "fast")
 MESH_OK = False
 FACES = np.zeros((0, 3), np.int64)
@@ -297,52 +295,6 @@ def _ground(a):
     a[..., 0] -= c0[0]; a[..., 2] -= c0[2]
     return a
 
-
-# ===== 渲染後製：減少抖動(時間) + 表面扭曲/重疊觀感(空間) =====
-def smooth_joints_time(joints, win):
-    """關節位置沿時間軸高斯平滑 → 減少逐幀抖動。joints:[L,22,3] → [L,22,3](win=半徑,0=關)。"""
-    L = joints.shape[0]
-    if win <= 0 or L < 2 * win + 1:
-        return joints
-    k = 2 * win + 1
-    g = torch.arange(k, device=joints.device, dtype=torch.float) - win
-    ker = torch.exp(-(g ** 2) / (2 * (win * 0.6 + 1e-6) ** 2))
-    ker = (ker / ker.sum()).view(1, 1, k)
-    x = joints.permute(1, 2, 0).contiguous().view(-1, 1, L)       # [66,1,L]
-    x = torch.nn.functional.pad(x, (win, win), mode="replicate")
-    y = torch.nn.functional.conv1d(x, ker)                        # [66,1,L]
-    return y.view(joints.shape[1], 3, L).permute(2, 0, 1).contiguous()
-
-
-_MESH_ADJ = None
-def _mesh_adj(N):
-    """由 FACES 建無向鄰接(雙向邊 index + 每點度數)，快取一次。"""
-    global _MESH_ADJ
-    if _MESH_ADJ is None:
-        f = torch.as_tensor(FACES, device=device, dtype=torch.long)
-        e = torch.cat([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]], 0)
-        e = torch.cat([e, e.flip(1)], 0)                          # 雙向
-        deg = torch.zeros(N, device=device).index_add_(
-            0, e[:, 0], torch.ones(e.shape[0], device=device)).clamp(min=1.0)
-        _MESH_ADJ = (e[:, 0].contiguous(), e[:, 1].contiguous(), deg)
-    return _MESH_ADJ
-
-
-def taubin_smooth(V, iters, lam=0.53, mu=-0.55):
-    """Taubin λ|μ 網格平滑(收縮免疫)：平順化 LBS 表面、淡化關節扭曲/重疊觀感。V:[F,N,3] → [F,N,3]。"""
-    if iters <= 0:
-        return V
-    idx_i, idx_j, deg = _mesh_adj(V.shape[1])
-    dinv = (1.0 / deg).view(1, -1, 1)
-    def lap(P):
-        nb = torch.zeros_like(P)
-        nb.index_add_(1, idx_i, P[:, idx_j])
-        return nb * dinv - P
-    for _ in range(iters):
-        V = V + lam * lap(V)
-        V = V + mu * lap(V)
-    return V
-
 # session cache: motion id -> {"mids": exact generated token list (per-scale), "len": frames}
 # 保存生成當下的『原始 token』本身，edit 時直接回餵當 source，不做 decode→encode 重量化（無精度漂移）。
 CACHE = {}
@@ -389,11 +341,9 @@ def _run(text, length, source_id, p):
         CACHE[mid] = {"mids": [s.detach().cpu() for s in mids], "len": int(m_len.item())}
         denorm = denorm_motion(pred, mean, std, pred.shape[0], device)                    # [1, L, 263]
         joints_t = motion_to_joints(denorm, cfg.data.joint_num)                           # [L, 22, 3]
-        joints_t = smooth_joints_time(joints_t, SMOOTH_WIN)                               # 減少抖動(時間平滑)
         if MESH_OK:
             if MESH_MODE == "lbs":
                 verts_t = lbs_vertices(joints_t)                                          # position-driven LBS(最快 + 真位移)
-                verts_t = taubin_smooth(verts_t, TAUBIN_ITERS)                            # 平順表面、淡化扭曲/重疊觀感
             elif MESH_MODE == "own":
                 verts_t = fit_smpl_own(joints_t, denorm)                                  # 自寫擬合(精準 + 真位移)
             elif MESH_MODE == "fit":
