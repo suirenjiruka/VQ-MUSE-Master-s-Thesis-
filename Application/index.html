@@ -430,7 +430,8 @@ async function requestGenerate(text){
     if(!r.ok) throw new Error('generate '+r.status);
     return await parseClip(r);
   }
-  await sleep(500); return {kind:'joints', frames:synth(textToParams(text)), fps:20, backendId:null};
+  await sleep(500); const mockParams=textToParams(text); mockParams.frames=p.length;
+  return {kind:'joints', frames:synth(mockParams), fps:20, backendId:null};
 }
 async function requestEdit(node, text){
   const p=readParams('edit');

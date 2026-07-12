@@ -301,6 +301,14 @@ def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=No
     j2s = joints2smpl(visual_cfg, num_frames=scaled_joints.shape[0], device=device, cuda=(device.type == "cuda"))
     rot2xyz = Rotation2xyz(visual_cfg, device=device)
     motion_tensor, opt_dict = j2s(scaled_joints, init_pose=sampled_init)
+    shape_values = list(getattr(vis_cfg, "smpl_body_betas", []))
+    if shape_values:
+        if len(shape_values) != 10:
+            raise ValueError(f"smpl_body_betas must contain 10 values, got {len(shape_values)}")
+        render_betas = torch.as_tensor(shape_values, dtype=torch.float32, device=device).view(1, 10)
+        render_betas = render_betas.expand(sampled_joints.shape[0], -1)
+    else:
+        render_betas = opt_dict["betas"] / 4
     vertices = rot2xyz(
         torch.as_tensor(motion_tensor, dtype=torch.float32, device=device).clone(),
         mask=None,
@@ -308,7 +316,7 @@ def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=No
         translation=True,
         glob=True,
         jointstype='vertices',
-        betas=(opt_dict["betas"] / 4),
+        betas=render_betas,
         vertstrans=True,
     )
     fitted_joints = rot2xyz(
@@ -318,7 +326,7 @@ def joints_to_fitted_smpl_vertices(joints, visual_cfg, vis_cfg, device, label=No
         translation=True,
         glob=True,
         jointstype='smpl',
-        betas=(opt_dict["betas"] / 4),
+        betas=render_betas,
         vertstrans=True,
     )
     vertices = vertices[0].permute(2, 0, 1).contiguous()
@@ -803,11 +811,18 @@ def add_labels(frame, caption, labels, frame_id, total_frames, vis_cfg=None):
     frame = frame.copy()
     h, w = frame.shape[:2]
     label_colors = [(35, 55, 150), (35, 125, 65), (150, 65, 35)] if len(labels) == 3 else [(35, 55, 150), (150, 65, 35)]
+    font_face = cv2.FONT_HERSHEY_DUPLEX
+    label_scale = float(getattr(vis_cfg, "label_font_scale", 1.0)) if vis_cfg is not None else 1.0
+    label_thickness = max(1, int(getattr(vis_cfg, "label_thickness", 3))) if vis_cfg is not None else 3
     for idx, label in enumerate(labels):
-        text_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.78, 2)[0]
+        text_size = cv2.getTextSize(label, font_face, label_scale, label_thickness)[0]
         x = int((idx + 0.5) * w / len(labels) - text_size[0] / 2)
-        cv2.putText(frame, label, (max(18, x), 38), cv2.FONT_HERSHEY_SIMPLEX, 0.78, label_colors[idx], 2, cv2.LINE_AA)
-    cv2.putText(frame, f"{frame_id + 1}/{total_frames}", (w - 120, h - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (30, 30, 30), 1, cv2.LINE_AA)
+        cv2.putText(frame, label, (max(18, x), 46), font_face,
+                    label_scale, label_colors[idx], label_thickness, cv2.LINE_AA)
+    frame_scale = float(getattr(vis_cfg, "frame_font_scale", 0.66)) if vis_cfg is not None else 0.66
+    frame_thickness = max(1, int(getattr(vis_cfg, "frame_thickness", 1))) if vis_cfg is not None else 1
+    cv2.putText(frame, f"{frame_id + 1}/{total_frames}", (w - 145, h - 24), font_face,
+                frame_scale, (30, 30, 30), frame_thickness, cv2.LINE_AA)
     if caption:
         text = caption[:130]
         bottom_margin = int(getattr(vis_cfg, "caption_bottom_margin", 160)) if vis_cfg is not None else 160
@@ -817,7 +832,8 @@ def add_labels(frame, caption, labels, frame_id, total_frames, vis_cfg=None):
         bar_bottom = max(58, h - bottom_margin)
         bar_top = max(44, bar_bottom - bar_height)
         cv2.rectangle(frame, (18, bar_top), (w - 18, bar_bottom), (255, 255, 255), -1)
-        cv2.putText(frame, text, (28, bar_bottom - 13), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (20, 20, 20), thickness, cv2.LINE_AA)
+        cv2.putText(frame, text, (28, bar_bottom - 15), font_face,
+                    font_scale, (20, 20, 20), thickness, cv2.LINE_AA)
     return frame
 
 
@@ -833,8 +849,8 @@ def generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device
 
     if has_source:
         source_code_idx, _ = vq_model.encode(src_motion_t[..., :cfg.data.dim_pose], src_m_length_t.clone())
-        pair_name = "source_gt_edit"
-        labels = ("Source", "GT Target", "Edited Output")
+        pair_name = "source_edit"
+        labels = ("Source", "Edited Output")
     else:
         source_code_idx = None
         pair_name = "gt_vs_gen"
@@ -864,8 +880,8 @@ def generate_prediction(sample, cfg, vis_cfg, vq_model, trans, mean, std, device
         )
     pred_motion = vq_model.forward_decoder(mids, m_length_t.clone())[0].detach().cpu().numpy()
     if has_source:
-        motions = [src_motion, tgt_motion, pred_motion]
-        lengths = [src_m_length, m_length, m_length]
+        motions = [src_motion, pred_motion]
+        lengths = [src_m_length, m_length]
     else:
         motions = [tgt_motion, pred_motion]
         lengths = [m_length, m_length]

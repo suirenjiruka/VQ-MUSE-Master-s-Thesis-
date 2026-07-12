@@ -383,7 +383,10 @@ def _run(text, length, source_id, p):
         mids = trans.generate(source_code_idx, [text], m_len // UNIT, has_src_t, t_drop=0,
                               source_keep_ratio=keep_ratio, **kwargs)
 
-        pred = vq_model.forward_decoder(mids, m_len.clone())[0].detach().cpu().numpy()   # [L, 263] normalized
+        # The VQ decoder returns its fixed 196-frame canvas; the requested
+        # duration is carried separately in m_len, so crop before rendering.
+        pred = vq_model.forward_decoder(mids, m_len.clone())[0, :int(m_len.item())]
+        pred = pred.detach().cpu().numpy()                                                # [L, 263] normalized
         mid = uuid.uuid4().hex[:8]
         # 保存這次產出的『原始 token』本身（含被編輯後的結果），供之後的 edit 直接當 source
         CACHE[mid] = {"mids": [s.detach().cpu() for s in mids], "len": int(m_len.item())}
