@@ -306,7 +306,9 @@ if __name__ == '__main__':
     if args.no_ema:
         use_ema = False
     trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=use_ema)
-    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+    if hasattr(trans, "set_vq_quantizer") and hasattr(vq_model, "quantizer"):
+        trans.set_vq_quantizer(vq_model.quantizer)
+    elif hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
         trans.set_vq_codebook(vq_model.quantizer.codebook)
 
     dataset_opt_path = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'Comp_v6_KLD005', 'opt.txt')

@@ -69,7 +69,9 @@ if __name__ == '__main__':
         print(f"missing keys from ckpt: {missing[:5]}")
     if unexpected:
         print(f"unexpected keys from ckpt: {unexpected[:5]}")
-    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+    if hasattr(trans, "set_vq_quantizer") and hasattr(vq_model, "quantizer"):
+        trans.set_vq_quantizer(vq_model.quantizer)
+    elif hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
         trans.set_vq_codebook(vq_model.quantizer.codebook)
     print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")})')
     trans.to(device).eval()

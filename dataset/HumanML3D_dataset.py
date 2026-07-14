@@ -618,6 +618,18 @@ class HML3DMotionEditDataset(data.Dataset):
     def __len__(self):
         return len(self.name_list)
 
+    def get_task_flags(self):
+        """Return one edit flag per name without sampling dataset items.
+
+        data_dict stores (text, source, target, target_length, has_source).
+        Keep this schema knowledge inside the dataset instead of duplicating a
+        fragile tuple index in the training entrypoint.
+        """
+        return np.asarray(
+            [int(bool(self.data_dict[name][4])) for name in self.name_list],
+            dtype=np.int64,
+        )
+
     def inv_transform(self, data):
         return data * self.std + self.mean
 

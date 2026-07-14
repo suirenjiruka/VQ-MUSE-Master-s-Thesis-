@@ -233,7 +233,9 @@ if __name__ == '__main__':
         device=device,
         full_length=cfg.data.max_motion_length // cfg.data.unit_length
     )
-    if hasattr(TV2m_transformer, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+    if hasattr(TV2m_transformer, "set_vq_quantizer") and hasattr(vq_model, "quantizer"):
+        TV2m_transformer.set_vq_quantizer(vq_model.quantizer)
+    elif hasattr(TV2m_transformer, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
         TV2m_transformer.set_vq_codebook(vq_model.quantizer.codebook)
     pc_vq = sum(param.numel() for param in TV2m_transformer.parameters())
     print(f"num of transformer parameter: {pc_vq / 1000} k")
@@ -263,7 +265,7 @@ if __name__ == '__main__':
     loader_collate_fn = collate_fn if args.dataset == DATASET_HML3D else None
 
     # task mix, keep gen dominant for regularization
-    is_edit = np.array([train_dataset.data_dict[name][7] for name in train_dataset.name_list], dtype=np.int64)
+    is_edit = train_dataset.get_task_flags()
     n_edit, n_gen = int(is_edit.sum()), int(len(is_edit) - is_edit.sum())
     print(f"train samples: gen {n_gen}, edit {n_edit}")
     if n_edit > 0 and n_gen > 0:

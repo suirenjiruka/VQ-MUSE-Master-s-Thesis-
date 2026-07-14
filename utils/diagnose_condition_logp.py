@@ -330,7 +330,9 @@ def main():
     vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
     vq_model = load_vq_model(cfg, vq_cfg, device)
     trans = load_trans(cfg, vq_cfg, ckpt_path, device)
-    if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
+    if hasattr(trans, "set_vq_quantizer") and hasattr(vq_model, "quantizer"):
+        trans.set_vq_quantizer(vq_model.quantizer)
+    elif hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
         trans.set_vq_codebook(vq_model.quantizer.codebook)
     dataset = build_dataset(cfg, mean, std, args.split, args.motionfix_start_id)
     indices = select_indices(dataset, "edit", 0, args.num_samples, random_select=True, seed=args.seed)

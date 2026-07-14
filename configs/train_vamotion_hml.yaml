@@ -6,7 +6,7 @@ exp:
   # name: 'mask_nlayer8_cdp0.1_rvq_nsplit_148'
   name: 'hml_momaskplus_hrvq5_nlayer8_cdp0.1_ic'
   device: 'cuda:0'
-  is_continue: True
+  is_continue: False
   is_train: True
   #video_stage: False
   seed: 10306
@@ -114,9 +114,9 @@ training:
         t_drop: 0.1
         s_drop: 0.0
         delta_beta: 0.15
-        weight_delta: 0.15
-        weight_latent: 0.01
-        weight_rank: 0.01
+        weight_delta: 0.20
+        weight_latent: 0.05
+        weight_rank: 0.02
         weight_null_gain: 0.0
       - name: edit_grounding
         end_epoch: 130
@@ -133,16 +133,16 @@ training:
         s_drop: 0.18
         delta_beta: 0.3
         weight_delta: 0.5
-        weight_latent: 0.05
-        weight_rank: 0.05
+        weight_latent: 0.15
+        weight_rank: 0.08
         weight_null_gain: 0.3
 
 loss:
   weight_transformer_loss: 1.0
   weight_motion_text_InfoNCE: 0.2
   weight_delta: 0.5
-  weight_latent: 0.05
-  weight_rank: 0.05
+  weight_latent: 0.15
+  weight_rank: 0.08
   weight_null_gain: 0.0
   delta_rank_margin: 0.2
   null_gain_margin: 0.05
