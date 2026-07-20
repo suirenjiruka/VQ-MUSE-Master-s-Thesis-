@@ -11,10 +11,6 @@ from model import VAMotion
 from VA_trainer import VA_motion_trainer
 from utils.get_opt import get_opt
 
-DATASET_HML3D     = 'hml3d'
-DATASET_SNAPMOGEN = 'snapmogen'
-
-
 class TaskRatioSampler(Sampler):
     def __init__(self, is_edit, num_samples, edit_ratio=0.5, replacement=True):
         self.is_edit = np.asarray(is_edit, dtype=np.int64)
@@ -50,7 +46,7 @@ class TaskRatioSampler(Sampler):
 def copy_runtime_training_overrides(saved_cfg, runtime_cfg):
     if hasattr(runtime_cfg.training, "curriculum"):
         saved_cfg.training.curriculum = runtime_cfg.training.curriculum
-    for key in ("max_epoch", "edit_sample_ratio", "m_drop", "v_drop", "t_drop", "s_drop", "mask_lo", "mask_hi", "mask_schedule"):
+    for key in ("max_epoch", "edit_sample_ratio", "m_drop", "source_cfg_drop_prob", "t_drop", "s_drop", "mask_lo", "mask_hi", "mask_schedule"):
         if key in runtime_cfg.training:
             saved_cfg.training[key] = runtime_cfg.training[key]
     for key in (
@@ -131,11 +127,6 @@ if __name__ == '__main__':
                         type=str,
                         default=None,
                         help='the path for continually training model, keep latest if is None')
-    parser.add_argument('--dataset',
-                        type=str,
-                        default=DATASET_HML3D,
-                        choices=[DATASET_SNAPMOGEN, DATASET_HML3D],
-                        help='which dataset to use for training (snapmogen | hml3d)')
     parser.add_argument('--gen_only',
                         action='store_true',
                         help='only use HML3D generation ids, skip MotionFix/edit ids')
@@ -159,7 +150,7 @@ if __name__ == '__main__':
     stage_dirname = 'VA_motion'
     cfg.exp.checkpoint_dir = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, stage_dirname)
 
-    print(f"dataset: {args.dataset}")
+    print("dataset: hml3d")
     print(f"gen_only: {args.gen_only}")
     print(f"max_epoch: {cfg.training.max_epoch}")
 
@@ -196,37 +187,34 @@ if __name__ == '__main__':
     cfg.vq = vq_cfg.quantizer
     cfg.vq.nb_code = vq_cfg.quantizer.nb_code
 
-    if args.dataset == DATASET_HML3D:
-        from SnapMogen_model.evaluator.hml.t2m_eval_wrapper import EvaluatorModelWrapper
+    from SnapMogen_model.evaluator.hml.t2m_eval_wrapper import EvaluatorModelWrapper
 
-        dataset_opt_path = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, "Comp_v6_KLD005", "opt.txt")
-        hml3d_opt = get_opt(dataset_opt_path, device)
-        motionfix_start_id = getattr(cfg.data, "motionfix_start_id", 400000)
-        train_split = pjoin(cfg.data.root_dir, "HumanML3D", 'train.txt')
-        val_split   = pjoin(cfg.data.root_dir, "HumanML3D", 'val.txt')
-        gen_eval_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_generation_eval.txt"), "generation", motionfix_start_id)
-        edit_eval_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_editing_eval.txt"), "editing", motionfix_start_id)
-        if args.gen_only:
-            train_split = build_task_split(train_split, pjoin(cfg.exp.eval_dir, "train_generation_only.txt"), "generation", motionfix_start_id)
-            val_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_generation_only.txt"), "generation", motionfix_start_id)
-            gen_eval_split = val_split
-            edit_eval_split = val_split
+    dataset_opt_path = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, "Comp_v6_KLD005", "opt.txt")
+    hml3d_opt = get_opt(dataset_opt_path, device)
+    motionfix_start_id = getattr(cfg.data, "motionfix_start_id", 400000)
+    train_split = pjoin(cfg.data.root_dir, "HumanML3D", 'train.txt')
+    val_split   = pjoin(cfg.data.root_dir, "HumanML3D", 'val.txt')
+    gen_eval_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_generation_eval.txt"), "generation", motionfix_start_id)
+    edit_eval_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_editing_eval.txt"), "editing", motionfix_start_id)
+    if args.gen_only:
+        train_split = build_task_split(train_split, pjoin(cfg.exp.eval_dir, "train_generation_only.txt"), "generation", motionfix_start_id)
+        val_split = build_task_split(val_split, pjoin(cfg.exp.eval_dir, "val_generation_only.txt"), "generation", motionfix_start_id)
+        gen_eval_split = val_split
+        edit_eval_split = val_split
 
-        eval_wrapper = EvaluatorModelWrapper(hml3d_opt)
-        edit_eval_wrapper = eval_wrapper
-        if getattr(cfg.inference, "edit_eval_wrapper", "tmr") == "tmr":
-            from evaluator.tmr_eval_wrapper import TMREvaluatorWrapper
-            edit_eval_wrapper = TMREvaluatorWrapper(
-                tmr_root=cfg.tmr.root,
-                run_dir=cfg.tmr.run_dir,
-                ckpt_name=getattr(cfg.tmr, "ckpt_name", "last"),
-                device=device,
-                mean=mean,
-                std=std,
-                input_is_normalized=getattr(cfg.tmr, "input_is_normalized", True)
-            )
-    else:
-        raise NotImplementedError("The current motion editing model no longer accepts the old SnapMogen video dataset batch.")
+    eval_wrapper = EvaluatorModelWrapper(hml3d_opt)
+    edit_eval_wrapper = eval_wrapper
+    if getattr(cfg.inference, "edit_eval_wrapper", "tmr") == "tmr":
+        from evaluator.tmr_eval_wrapper import TMREvaluatorWrapper
+        edit_eval_wrapper = TMREvaluatorWrapper(
+            tmr_root=cfg.tmr.root,
+            run_dir=cfg.tmr.run_dir,
+            ckpt_name=getattr(cfg.tmr, "ckpt_name", "last"),
+            device=device,
+            mean=mean,
+            std=std,
+            input_is_normalized=getattr(cfg.tmr, "input_is_normalized", True)
+        )
 
     TV2m_transformer = VAMotion(
         cfg=cfg,
@@ -246,23 +234,22 @@ if __name__ == '__main__':
     trainer = VA_motion_trainer(cfg, vq_model=vq_model, va_transformer=TV2m_transformer, eval_wrapper=eval_wrapper,
                                 edit_eval_wrapper=edit_eval_wrapper, device=device, resume_ckpt=args.OnGoing_model)
 
-    if args.dataset == DATASET_HML3D:
-        from dataset.HumanML3D_dataset import HML3DMotionEditDataset, Text2MotionDatasetEval, collate_fn
-        from utils.word_vectorizer import WordVectorizer
-        hml3d_opt.root_dir = cfg.data.root_dir
-        hml3d_opt.max_motion_length = cfg.data.max_motion_length
-        hml3d_opt.unit_length = cfg.data.unit_length
-        hml3d_opt.motion_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joint_vecs")
-        hml3d_opt.joint_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joints")
-        hml3d_opt.text_dir = pjoin(cfg.data.root_dir, "HumanML3D", "texts")
-        hml3d_opt.motionfix_start_id = getattr(cfg.data, "motionfix_start_id", 400000)
-        w_vectorizer = WordVectorizer('./glove', 'our_vab')
-        train_dataset = HML3DMotionEditDataset(hml3d_opt, mean, std, train_split)
-        val_dataset   = HML3DMotionEditDataset(hml3d_opt, mean, std, val_split, w_vectorizer=w_vectorizer)
-        edit_eval_dataset = HML3DMotionEditDataset(hml3d_opt, mean, std, edit_eval_split, w_vectorizer=w_vectorizer)
-        gen_eval_dataset = Text2MotionDatasetEval(hml3d_opt, mean, std, gen_eval_split, w_vectorizer)
+    from dataset.HumanML3D_dataset import HML3DMotionEditDataset, Text2MotionDatasetEval, collate_fn
+    from utils.word_vectorizer import WordVectorizer
+    hml3d_opt.root_dir = cfg.data.root_dir
+    hml3d_opt.max_motion_length = cfg.data.max_motion_length
+    hml3d_opt.unit_length = cfg.data.unit_length
+    hml3d_opt.motion_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joint_vecs")
+    hml3d_opt.joint_dir = pjoin(cfg.data.root_dir, "HumanML3D", "new_joints")
+    hml3d_opt.text_dir = pjoin(cfg.data.root_dir, "HumanML3D", "texts")
+    hml3d_opt.motionfix_start_id = getattr(cfg.data, "motionfix_start_id", 400000)
+    w_vectorizer = WordVectorizer('./glove', 'our_vab')
+    train_dataset = HML3DMotionEditDataset(hml3d_opt, mean, std, train_split)
+    val_dataset   = HML3DMotionEditDataset(hml3d_opt, mean, std, val_split, w_vectorizer=w_vectorizer)
+    edit_eval_dataset = HML3DMotionEditDataset(hml3d_opt, mean, std, edit_eval_split, w_vectorizer=w_vectorizer)
+    gen_eval_dataset = Text2MotionDatasetEval(hml3d_opt, mean, std, gen_eval_split, w_vectorizer)
 
-    loader_collate_fn = collate_fn if args.dataset == DATASET_HML3D else None
+    loader_collate_fn = collate_fn
 
     # task mix, keep gen dominant for regularization
     is_edit = train_dataset.get_task_flags()

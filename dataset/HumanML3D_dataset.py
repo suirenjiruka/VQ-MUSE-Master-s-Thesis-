@@ -8,7 +8,6 @@ import random
 import codecs as cs
 import hashlib
 from collections import defaultdict
-from .PR_VIPE_end import pr_vipe_infer
 
 def collate_fn(batch):
     batch.sort(key=lambda x: x[3], reverse=True)
@@ -237,71 +236,6 @@ class Text2MotionDatasetEval(data.Dataset):
         # print(tokens)
         return word_embeddings, pos_one_hots, caption, sent_len, motion, m_length, '_'.join(tokens), idx
     
-class Text_2D_MotionDatasetEval(Text2MotionDatasetEval):
-    def __init__(self, opt, mean, std, split_file, w_vectorizer, feat2D_dir, vipe_checkpt):
-        super().__init__(opt, mean, std, split_file, w_vectorizer)
-        from dataset.PR_VIPE_end import read_input, pr_vipe_infer
-
-        seen, data_2D_raw, drop = set(), {}, {}  # inspect all exisitng mid without repeat
-        for name in self.name_list:
-            mid = self.data_dict[name]['mid']
-            if mid in seen:
-                continue
-            seen.add(mid)
-            try:
-                raw = np.array(read_input(pjoin(feat2D_dir, f"{mid}.json")))
-                # raw: [num_windows, 7, 15, 2]
-                data_2D_raw[mid] = raw
-                drop[mid] = 0
-            except Exception:
-                data_2D_raw[mid] = np.zeros((1, 7, 15, 2), dtype=float)
-                drop[mid] = 1
-
-        gaussian_data = pr_vipe_infer(vipe_checkpt, data_2D_raw)
-
-        # reshape to frame feature
-        self.data_joint   = {mid: arr.reshape(-1, 30)
-                             for mid, arr in data_2D_raw.items()}
-        self.data_gaussian = gaussian_data   # mid to gaussian
-        self.drop          = drop
-
-    def __getitem__(self, item):
-        word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token, idx  = super().__getitem__(item)
-        list_idx = self.pointer + item
-        name     = self.name_list[list_idx]
-        entry    = self.data_dict[name]
-        mid    = entry["mid"]
-        offset = entry['offset']   # frame offset within mid's full sequence
-
-        video_startt = offset + idx
-
-        # Raw joints [max_motion_length, 30]
-        joints = self.data_joint[mid]
-        video_joints = joints[video_startt : video_startt + m_length]
-        joint_len    = len(video_joints)
-        if joint_len < self.max_motion_length:
-            video_joints = np.concatenate([video_joints,np.zeros((self.max_motion_length - joint_len, 30))],axis=0)
-
-        # PR-VIPE Gaussian (window stride = 7 frames)
-        max_vipe_len = self.max_motion_length // 7 + 2  #includ the windows of head and tails
-        g_mean, g_std = self.data_gaussian[mid]
-        gaussian_start = video_startt // 7
-        gaussian_end = (video_startt + m_length) // 7 + 1
-        g_mean = g_mean[gaussian_start: gaussian_end].astype(np.float32)
-        g_std  = g_std [gaussian_start: gaussian_end].astype(np.float32)
-        v_len  = len(g_mean)
-        if v_len < max_vipe_len:
-            pad    = max_vipe_len - v_len
-            g_mean = np.concatenate([g_mean, np.zeros((pad, g_mean.shape[1]), dtype=np.float32)], axis=0)
-            g_std  = np.concatenate([g_std,  np.zeros((pad, g_std.shape[1]),  dtype=np.float32)], axis=0)
-
-        dropout = self.drop[mid]
-
-        return (word_embeddings, pos_one_hots, clip_text, sent_len, pose, m_length, token, g_mean, g_std, v_len,
-                video_joints, joint_len, dropout)
-
-
-
 class Text2MotionDataset(data.Dataset):
     def __init__(self, opt, mean, std, split_file):
         self.opt = opt
@@ -428,69 +362,6 @@ class Text2MotionDataset(data.Dataset):
         self.pointer = np.searchsorted(self.length_arr, length)
         print("Pointer Pointing at %d" % self.pointer)
 
-class Text_2D_MotionDataset(Text2MotionDataset):
-    def __init__(self, opt, mean, std, split_file, feat2D_dir, vipe_checkpt):
-        super().__init__(opt, mean, std, split_file)
-        from dataset.PR_VIPE_end import read_input, pr_vipe_infer
-
-        seen, data_2D_raw, drop = set(), {}, {}  # inspect all exisitng mid without repeat
-        for name in self.name_list:
-            mid = self.data_dict[name]['mid']
-            if mid in seen:
-                continue
-            seen.add(mid)
-            try:
-                raw = np.array(read_input(pjoin(feat2D_dir, f"{mid}.json")))
-                # raw: [num_windows, 7, 15, 2]
-                data_2D_raw[mid] = raw
-                drop[mid] = 0
-            except Exception:
-                data_2D_raw[mid] = np.zeros((1, 7, 15, 2), dtype=float)
-                drop[mid] = 1
-
-        gaussian_data = pr_vipe_infer(vipe_checkpt, data_2D_raw)
-
-        # reshape to frame feature
-        self.data_joint   = {mid: arr.reshape(-1, 30)
-                             for mid, arr in data_2D_raw.items()}
-        self.data_gaussian = gaussian_data   # mid to gaussian
-        self.drop          = drop
-
-    def __getitem__(self, item):
-        caption, motion, m_length, idx = super().__getitem__(item)
-        list_idx = self.pointer + item
-        name     = self.name_list[list_idx]
-        entry    = self.data_dict[name]
-        mid    = entry['mid']
-        offset = entry['offset']   # frame offset within mid's full sequence
-
-        video_startt = offset + idx
-
-        # Raw joints [max_motion_length, 30]
-        joints = self.data_joint[mid]
-        video_joints = joints[video_startt : video_startt + m_length]
-        joint_len  = len(video_joints)
-        if joint_len < self.max_motion_length:
-            video_joints = np.concatenate([video_joints,np.zeros((self.max_motion_length - joint_len, 30))],axis=0)
-
-        # PR-VIPE Gaussian (window stride = 7 frames)
-        max_vipe_len = self.max_motion_length // 7 + 2  #includ the windows of head and tails
-        g_mean, g_std = self.data_gaussian[mid]
-        gaussian_start = video_startt // 7
-        gaussian_end = (video_startt + m_length) // 7 + 1
-        g_mean = g_mean[gaussian_start: gaussian_end].astype(np.float32)
-        g_std  = g_std [gaussian_start: gaussian_end].astype(np.float32)
-        v_len  = len(g_mean)
-        if v_len < max_vipe_len:
-            pad    = max_vipe_len - v_len
-            g_mean = np.concatenate([g_mean, np.zeros((pad, g_mean.shape[1]), dtype=np.float32)], axis=0)
-            g_std  = np.concatenate([g_std,  np.zeros((pad, g_std.shape[1]),  dtype=np.float32)], axis=0)
-
-        dropout = self.drop[mid]
-
-        return (caption, motion, m_length, g_mean, g_std, v_len,
-                video_joints, joint_len, dropout)
-    
 class HML3DMotionEditDataset(data.Dataset):
     def __init__(self, opt, mean, std, split_file, motionfix_start_id=400000, w_vectorizer=None):
         self.opt, self.mean, self.std = opt, mean, std

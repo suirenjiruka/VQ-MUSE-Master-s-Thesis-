@@ -80,7 +80,5 @@ JOINT_REGRESSOR_TRAIN_EXTRA: "./visualize/smpl_models/smpl/J_regressor_extra.npy
 
 # Ouput
 Output_DIR: "/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/visualize/viusalized_motion"
-vipe_checkpt: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/pr_vipe_models/model.ckpt-02059146'
-
 # for collsion 
 Part_Seg_DIR: "./visualize/joints2smpl/smpl_models/smplx_parts_segm.pkl"

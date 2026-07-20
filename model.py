@@ -139,7 +139,7 @@ class VAMotion(nn.Module):
         self.full_length = full_length
         self.motion_drop_prob = getattr(cfg.training, "m_drop", getattr(cfg.training, "target_full_mask_prob", 0.1)) # target fully masked CFG branch
         self.text_drop_prob = getattr(cfg.training, "t_drop", getattr(cfg.training, "text_cfg_drop_prob", 0.1))   # text dropout for CFG
-        self.source_drop_prob = getattr(cfg.training, "v_drop", getattr(cfg.training, "source_cfg_drop_prob", 0.0)) # source dropout for CFG
+        self.source_drop_prob = getattr(cfg.training, "source_cfg_drop_prob", 0.0)
         self.source_token_drop_prob = getattr(cfg.training, "s_drop", getattr(cfg.training, "source_token_drop_prob", 0.0))
         self.mask_ratio_lo = float(getattr(cfg.training, "mask_lo", 0.0))
         self.mask_ratio_hi = float(getattr(cfg.training, "mask_hi", 1.0))

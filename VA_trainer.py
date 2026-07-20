@@ -7,7 +7,6 @@ from torch.utils.tensorboard import SummaryWriter
 from os.path import join as pjoin
 from transformers import get_cosine_schedule_with_warmup
 from evaluator.evaluator import evaluation_generation_hml, evaluation_generation_hml_mixed, evaluation_motion_editing_hml
-from SnapMogen_model.transformer.tools import *
 
 '''
 Training code is borrowed from the framework of SnapMogen, including VQ-model, traing process, and most relatted configuratioon
@@ -176,7 +175,7 @@ class VA_motion_trainer:
         for key, attr in (
             ("m_drop", "motion_drop_prob"),
             ("t_drop", "text_drop_prob"),
-            ("v_drop", "source_drop_prob"),
+            ("source_cfg_drop_prob", "source_drop_prob"),
             ("s_drop", "source_token_drop_prob"),
             ("mask_lo", "mask_ratio_lo"),
             ("mask_hi", "mask_ratio_hi"),
