@@ -370,7 +370,7 @@ class joints2smpl:
                             device=self.device)
 
 
-    def __call__(self, input_joints):
+    def __call__(self, input_joints, init_pose=None):
         pred_pose = torch.zeros(self.batch_size, 72).to(self.device)
         pred_betas = torch.zeros(self.batch_size, 10).to(self.device)
         pred_cam_t = torch.zeros(self.batch_size, 3).to(self.device)
@@ -386,6 +386,9 @@ class joints2smpl:
         pred_betas = self.init_mean_shape
         pred_pose = self.init_mean_pose   # []
         pred_cam_t = self.cam_trans_zero
+        # warm-start：若給了初始姿勢(用動作自身旋轉算出)，用它取代平均姿勢 → 迭代少很多就收斂
+        if init_pose is not None:
+            pred_pose = torch.as_tensor(init_pose, dtype=torch.float32, device=self.device).reshape(self.batch_size, 72)
         # raise the optimization weight on feet (增加腳部貼地權種正確性避免滑動)
         confidence_input = torch.ones(self.num_joints)
         confidence_input[7] = 1.5

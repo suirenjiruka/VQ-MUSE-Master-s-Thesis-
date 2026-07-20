@@ -2,16 +2,16 @@ trans_cfg: './configs/train_vamotion_hml.yaml'
 visual_cfg: './utils/visual_config.yaml'
 
 # Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
-ckpt: 'best.tar'
+ckpt: 'best_45_1.tar'
 
 # Data selection
 split: 'test'
-mode: 'all'  # all | gen | edit
+mode: 'edit'  # source + edited output only; all | gen | edit
 num_samples: 4
 start_index: 0
 random_select: True
 motionfix_start_id: 400000
-seed: 15622
+seed: 13475
 # Sampling
 time_steps: 20
 cond_scale: 2
@@ -31,6 +31,7 @@ max_frames: 60
 use_proxy_mesh: True
 mesh_mode: 'smpl_fit'  # smpl_fit = SMPLify from recovered joints; smpl = fast HML-rot mesh; joint = capsule/sphere debug; none = skeleton only
 skeleton_only: False
+smpl_body_betas: [0.0, 1.2, 0.0, 0.8, 0.0, -0.4, 0.0, 0.6, 0.0, 0.0]
 mesh_align_to_joints: True
 mesh_alignment_scale: True
 smpl_fit_input_scale: 1.0
@@ -88,9 +89,13 @@ face_detail_radius: 0.0045
 floor_color: [0.86, 0.89, 0.94, 1.0]
 bone_radius: 0.006
 joint_radius: 0.010
+label_font_scale: 1.08
+label_thickness: 2
+frame_font_scale: 0.66
+frame_thickness: 1
 caption_bottom_margin: 170
-caption_bar_height: 48
-caption_font_scale: 0.72
+caption_bar_height: 64
+caption_font_scale: 0.98
 caption_thickness: 2
 view_spacing: 1.65
 mesh_limb_radius: 0.055

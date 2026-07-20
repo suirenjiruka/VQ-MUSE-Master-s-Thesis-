@@ -69,6 +69,9 @@ amass_smpl_idx: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 1
 
 
 SMPL_MODEL_DIR: "./visualize/smpl_models/"
+SMPL_BODY_BETAS: [0.0, 0.7, 0.0, 0.0, 0.0, 0.5, 0.0, -0.15, 0.0, 0.0]
+SMPL_MALE_BETAS: [0.3, -0.7, 0.0, 0.5, 0.5, 0.0, 0.5, 0.0, -0.5, 0.0]
+SMPL_MALE_GENDER_EXTRAPOLATION: 0.75
 GMM_MODEL_DIR: "./visualize/smpl_models/"
 SMPL_MEAN_FILE: "./visualize/smpl_models/neutral_smpl_mean_params.h5"
 
