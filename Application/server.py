@@ -11,7 +11,7 @@ Run (in the WSL / conda env that has torch + the project deps):
 
 Env overrides:  TRANS_CFG (default configs/train_vamotion_hml.yaml), CKPT (default best.tar), PORT (5000)
 """
-import os, sys, uuid, threading
+import os, sys, time, uuid, threading
 from os.path import join as pjoin
 
 import numpy as np
@@ -71,15 +71,16 @@ FPS  = int(getattr(cfg.data, "fps", 20))
 print(f"[boot] ready on {device} · unit={UNIT} · dim={DIM} · fps={FPS}", flush=True)
 
 # --- body render mode ---
-# MESH_MODE=lbs(預設): position-driven LBS(品質強化版，最快)。用 22 關節位置直接把 SMPL 皮膚變形貼合，
+# MESH_MODE=lbs      : position-driven LBS(快速 fallback)。用 22 關節位置直接把 SMPL 皮膚變形貼合，
 #                      無 per-frame 優化。① SMPL pose blendshape 補回關節體積 ④ 沿骨軸伸縮消關節縫隙。
 #                      四肢 twist 不從位置猜(forearm 等 roll 不可觀測，硬解反而扭曲)→ 用乾淨 swing。
-# MESH_MODE=own      : 自寫 SMPL 擬合(Adam 優化 pose+shape+transl，最準但慢)。
+# MESH_MODE=own(預設): minimum-twist IK + 官方 SMPL skinning；固定精瘦身形，不拉扯表面。
 # MESH_MODE=fit      : visualize 的 joints2smpl SMPLify(保留對照)。
 # MESH_MODE=fast     : rot6d 直接前向(免優化，會扭曲，不建議)。
 # MESH_MODE=metaball : 回傳關節點，前端 metaball 皮膚(不碰 SMPL)。
-MESH_MODE   = os.environ.get("MESH_MODE", "lbs").lower()
-OWN_ITERS   = int(os.environ.get("OWN_ITERS", "400"))   # 自寫擬合迭代數(精度優先，可調)
+MESH_MODE   = os.environ.get("MESH_MODE", "own").lower()
+OWN_ITERS   = int(os.environ.get("OWN_ITERS", "48"))
+OWN_BUDGET  = float(os.environ.get("OWN_BUDGET", "2.8")) # fitting time budget in seconds
 SMPL_ITERS  = int(os.environ.get("SMPL_ITERS", "8"))    # fit 模式 warm-start 後迭代
 SMPL_STRIDE = int(os.environ.get("SMPL_STRIDE", "1"))
 WARM        = os.environ.get("WARM", "1") != "0"        # 用動作旋轉當初始姿勢(warm-start)
@@ -87,6 +88,7 @@ LBS_POSE_BS = os.environ.get("LBS_POSE_BS", "1") != "0" # ① pose blendshape(�
 LBS_STRETCH = os.environ.get("LBS_STRETCH", "1") != "0" # ④ 沿骨軸伸縮(消關節縫隙)
 SMOOTH_WIN  = int(os.environ.get("SMOOTH_WIN", "2"))    # 關節時間平滑半徑(減少抖動；0=關)
 TAUBIN_ITERS= int(os.environ.get("TAUBIN_ITERS", "2"))  # 網格 Taubin 平滑迭代(減少表面扭曲/重疊觀感；0=關)
+IK_SMOOTH_WIN = int(os.environ.get("IK_SMOOTH_WIN", "3"))
 NEED_SMPL = MESH_MODE in ("lbs", "own", "fit", "fast")
 MESH_OK = False
 FACES = np.zeros((0, 3), np.int64)
@@ -96,24 +98,102 @@ fit_vertices = proxy_vertices = _init_pose_fns = None
 if NEED_SMPL:
     try:
         import smplx as _smplx
+        from smplx.lbs import lbs as _raw_lbs
         # warm-start 用的旋轉轉換(與 motion_to_proxy_vertices 同慣例)
         from utils.motion_process_bvh import recover_root_rot_pos as _rrp
         from utils.common.quaternion import qinv as _qinv
         from utils.rotation_conversions import (
-            quaternion_to_matrix as _q2m, rotation_6d_to_matrix as _r6m, matrix_to_axis_angle as _m2aa,
+            quaternion_to_matrix as _q2m, matrix_to_quaternion as _m2q,
+            rotation_6d_to_matrix as _r6m, matrix_to_axis_angle as _m2aa,
+            axis_angle_to_matrix as _aa2m,
         )
         _init_pose_fns = (_rrp, _qinv, _q2m, _r6m, _m2aa)
         VISUAL_CFG = load_config(pjoin(ROOT, "utils", "visual_config.yaml"))
         SMPL_DIR = VISUAL_CFG.SMPL_MODEL_DIR
         _faces_model = _smplx.create(SMPL_DIR, model_type="smpl", gender="neutral", ext="pkl", batch_size=1)
         FACES = np.asarray(_faces_model.faces, dtype=np.int64)
-        if MESH_MODE == "lbs":
+        raw_model = None
+        if MESH_MODE in ("lbs", "own"):
             # position-driven LBS 綁定資產(rest 模板 / skinning 權重 / rest 關節 / 骨架樹 / pose 修形基底)
             v_template = _faces_model.v_template.to(device).float()                     # [6890, 3]
+            shape_values = list(getattr(VISUAL_CFG, "SMPL_BODY_BETAS", [0.0] * 10))
+            if len(shape_values) != int(_faces_model.num_betas):
+                raise ValueError(
+                    f"SMPL_BODY_BETAS needs {_faces_model.num_betas} values, got {len(shape_values)}"
+                )
+            shape_betas = torch.as_tensor(shape_values, device=device, dtype=v_template.dtype)
+            v_template = v_template + torch.einsum(
+                "vcn,n->vc", _faces_model.shapedirs.to(device).float(), shape_betas
+            )
             J_regressor = _faces_model.J_regressor.to(device).float()                   # [24, 6890]
             lbs_w = _faces_model.lbs_weights.to(device).float()                         # [6890, 24]
             parents = _faces_model.parents.to(device).long()                            # [24]
             J_rest = J_regressor @ v_template                                           # [24, 3] rest 關節
+            if MESH_MODE == "own":
+                male_path = pjoin(SMPL_DIR, "smplx", "SMPLX_MALE.npz")
+                if not os.path.isfile(male_path):
+                    raise FileNotFoundError(f"Male SMPL-X core model not found: {male_path}")
+                with np.load(male_path, allow_pickle=True) as male_data:
+                    FACES = np.asarray(male_data["f"], dtype=np.int64)
+                    male_v_template = torch.as_tensor(
+                        male_data["v_template"], device=device, dtype=torch.float32
+                    )
+                    male_shapedirs = torch.as_tensor(
+                        male_data["shapedirs"][:, :, :10], device=device, dtype=torch.float32
+                    )
+                    male_posedirs_np = male_data["posedirs"]
+                    male_posedirs = torch.as_tensor(
+                        male_posedirs_np.reshape(-1, male_posedirs_np.shape[-1]).T,
+                        device=device,
+                        dtype=torch.float32,
+                    ).contiguous()
+                    J_regressor = torch.as_tensor(
+                        male_data["J_regressor"], device=device, dtype=torch.float32
+                    )
+                    lbs_w = torch.as_tensor(
+                        male_data["weights"], device=device, dtype=torch.float32
+                    )
+                    parents = torch.as_tensor(
+                        male_data["kintree_table"][0], device=device, dtype=torch.long
+                    ).clone()
+                parents[0] = -1
+                male_shape_values = list(getattr(VISUAL_CFG, "SMPL_MALE_BETAS", [0.0] * 10))
+                if len(male_shape_values) != 10:
+                    raise ValueError(
+                        f"SMPL_MALE_BETAS needs 10 values, got {len(male_shape_values)}"
+                    )
+                male_betas = torch.as_tensor(
+                    male_shape_values, device=device, dtype=torch.float32
+                )
+                female_path = pjoin(SMPL_DIR, "smplx", "SMPLX_FEMALE_LOCKED.npz")
+                if not os.path.isfile(female_path):
+                    raise FileNotFoundError(
+                        f"Corresponding female SMPL-X core model not found: {female_path}"
+                    )
+                with np.load(female_path, allow_pickle=True) as female_data:
+                    female_v_template = torch.as_tensor(
+                        female_data["v_template"], device=device, dtype=torch.float32
+                    )
+                gender_alpha = float(
+                    getattr(VISUAL_CFG, "SMPL_MALE_GENDER_EXTRAPOLATION", 0.75)
+                )
+                v_template = (
+                    male_v_template
+                    + gender_alpha * (male_v_template - female_v_template)
+                    + torch.einsum(
+                    "vcn,n->vc", male_shapedirs, male_betas
+                    )
+                )
+                J_rest = J_regressor @ v_template
+                raw_model = dict(
+                    v_template=v_template,
+                    shapedirs=male_shapedirs,
+                    posedirs=male_posedirs,
+                    J_regressor=J_regressor,
+                    lbs_w=lbs_w,
+                    parents=parents,
+                    betas=torch.zeros_like(male_betas),
+                )
             NJ = parents.shape[0]
             dir_children = [[] for _ in range(NJ)]                                      # 骨架樹(僅 22 HML 關節連骨)
             for j in range(1, NJ):
@@ -131,7 +211,7 @@ if NEED_SMPL:
             posedirs = _faces_model.posedirs.to(device).float()                        # [207, 20670] SMPL 姿勢修形基底
             LBS = dict(v_template=v_template, lbs_w=lbs_w, parents=parents, J_rest=J_rest,
                        NJ=NJ, dir_children=dir_children, rest_dir=rest_dir, is_leaf=is_leaf,
-                       posedirs=posedirs)
+                       posedirs=posedirs, raw_model=raw_model)
         if MESH_MODE in ("fit", "fast"):
             from utils.smpl import SMPL as _SMPL
             from utils.visualize_motion_editing_hml import (
@@ -145,7 +225,9 @@ if NEED_SMPL:
             fit_vertices, proxy_vertices = _fit, _proxy
         MESH_OK = True
         detail = {"lbs": f"pose_bs={int(LBS_POSE_BS)} stretch={int(LBS_STRETCH)}",
-                  "own": f"iters={OWN_ITERS}"}.get(MESH_MODE, f"iters={SMPL_ITERS} stride={SMPL_STRIDE}")
+                  "own": "minimum-twist IK + male SMPL-X core"}.get(
+                      MESH_MODE, f"iters={SMPL_ITERS} stride={SMPL_STRIDE}"
+                  )
         print(f"[boot] SMPL mesh ON · mode={MESH_MODE} warm={WARM} · faces={FACES.shape[0]} · {detail}", flush=True)
     except Exception as e:
         MESH_OK = False
@@ -245,6 +327,193 @@ def lbs_vertices(target_joints):
     return acc
 
 
+def smooth_rotation_matrices(rotations, radius):
+    """Temporally smooth rotations in quaternion space without deforming vertices."""
+    frame_count, joint_count = rotations.shape[:2]
+    if radius <= 0 or frame_count < 3:
+        return rotations
+
+    quaternions = _m2q(rotations)
+    aligned = [quaternions[0]]
+    max_step = 0.30
+    for frame_idx in range(1, frame_count):
+        current = quaternions[frame_idx]
+        sign = torch.where(
+            (current * aligned[-1]).sum(dim=-1, keepdim=True) < 0.0,
+            -torch.ones_like(current[..., :1]),
+            torch.ones_like(current[..., :1]),
+        )
+        current = current * sign
+        previous = aligned[-1]
+        dot = (current * previous).sum(dim=-1, keepdim=True).clamp(0.0, 1.0)
+        angle = 2.0 * torch.acos(dot)
+        alpha = torch.clamp(max_step / angle.clamp(min=1e-6), max=1.0)
+        current = previous + alpha * (current - previous)
+        current = current / current.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        aligned.append(current)
+    quaternions = torch.stack(aligned, dim=0)
+
+    kernel_size = 2 * radius + 1
+    offsets = torch.arange(
+        kernel_size, device=rotations.device, dtype=rotations.dtype
+    ) - radius
+    sigma = max(0.8, radius * 0.6)
+    kernel = torch.exp(-(offsets ** 2) / (2.0 * sigma ** 2))
+    kernel = kernel / kernel.sum()
+
+    channels = joint_count * 4
+    signal = quaternions.permute(1, 2, 0).reshape(1, channels, frame_count)
+    signal = torch.nn.functional.pad(signal, (radius, radius), mode="replicate")
+    weights = kernel.view(1, 1, kernel_size).expand(channels, 1, -1)
+    smoothed = torch.nn.functional.conv1d(signal, weights, groups=channels)
+    smoothed = smoothed.reshape(joint_count, 4, frame_count).permute(2, 0, 1)
+    smoothed = smoothed / smoothed.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return _q2m(smoothed)
+
+
+def orientation_basis(right, up):
+    """Build a stable right/up/forward frame from two observed body axes."""
+    right = right / right.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    up = up - (up * right).sum(dim=-1, keepdim=True) * right
+    up = up / up.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    forward = torch.cross(right, up, dim=-1)
+    forward = forward / forward.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return torch.stack([right, up, forward], dim=-1)
+
+
+def clamp_local_rotation(rotation, max_angle):
+    """Limit local joint bend while preserving its rotation axis."""
+    axis_angle = _m2aa(rotation)
+    angle = axis_angle.norm(dim=-1, keepdim=True)
+    scale = torch.clamp(max_angle / angle.clamp(min=1e-8), max=1.0)
+    return _aa2m(axis_angle * scale)
+
+
+def ik_smpl_vertices(target_joints):
+    """Recover minimum-twist SMPL rotations from the 22 HML joint positions.
+
+    Unlike the fast LBS path, this never stretches or directly deforms mesh
+    vertices. Joint directions only determine valid local SMPL rotations; the
+    official SMPL skinning function produces the final surface.
+    """
+    rest_joints = LBS["J_rest"]
+    parents = LBS["parents"]
+    children = LBS["dir_children"]
+    rest_dir = LBS["rest_dir"]
+    joint_count = int(LBS["NJ"])
+    frame_count = target_joints.shape[0]
+    eye = torch.eye(3, device=device, dtype=target_joints.dtype)
+
+    target = torch.zeros(
+        frame_count, joint_count, 3, device=device, dtype=target_joints.dtype
+    )
+    target[:, :22] = target_joints
+    if joint_count > 22:
+        target[:, 22] = target_joints[:, 20]
+    if joint_count > 23:
+        target[:, 23] = target_joints[:, 21]
+
+    local_rot = eye.view(1, 1, 3, 3).repeat(frame_count, joint_count, 1, 1)
+    global_rot = local_rot.clone()
+
+    for joint_idx in range(joint_count):
+        if joint_idx == 0:
+            parent_rot = eye.expand(frame_count, 3, 3)
+        else:
+            parent_rot = global_rot[:, int(parents[joint_idx])]
+
+        child_ids = children[joint_idx]
+        if joint_idx == 12:
+            # Head yaw is not observable from a 22-joint skeleton. Anchor the
+            # neck/head frame to the shoulder axis and upper-spine direction
+            # instead of letting a noisy head point twist the entire head.
+            rest_basis = orientation_basis(
+                rest_joints[17] - rest_joints[16],
+                rest_joints[12] - rest_joints[9],
+            )
+            target_basis = orientation_basis(
+                target[:, 17] - target[:, 16],
+                target[:, 12] - target[:, 9],
+            )
+            desired_global = torch.matmul(target_basis, rest_basis.transpose(-1, -2))
+            local = torch.bmm(parent_rot.transpose(1, 2), desired_global)
+        elif len(child_ids) >= 2:
+            rest_offsets = rest_joints[child_ids] - rest_joints[joint_idx]
+            world_offsets = target[:, child_ids] - target[:, joint_idx:joint_idx + 1]
+            parent_offsets = torch.einsum(
+                "fij,fnj->fni", parent_rot.transpose(1, 2), world_offsets
+            )
+            covariance = torch.einsum("ni,fnj->fij", rest_offsets, parent_offsets)
+            u, _, vh = torch.linalg.svd(covariance)
+            v = vh.transpose(1, 2)
+            ut = u.transpose(1, 2)
+            correction = eye.expand(frame_count, 3, 3).clone()
+            correction[:, 2, 2] = torch.sign(torch.det(torch.bmm(v, ut)))
+            local = torch.bmm(torch.bmm(v, correction), ut)
+        elif len(child_ids) == 1:
+            child_idx = child_ids[0]
+            world_bone = target[:, child_idx] - target[:, joint_idx]
+            world_bone = world_bone / world_bone.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            parent_bone = torch.einsum(
+                "fij,fj->fi", parent_rot.transpose(1, 2), world_bone
+            )
+            local = _shortest_arc(
+                rest_dir[joint_idx].expand(frame_count, 3), parent_bone
+            )
+        else:
+            # End effectors have no observable twist from joint positions.
+            # Identity inherits the parent orientation and avoids arbitrary
+            # wrist, foot, and head roll.
+            local = eye.expand(frame_count, 3, 3)
+
+        local_rot[:, joint_idx] = local
+        global_rot[:, joint_idx] = torch.bmm(parent_rot, local)
+
+    # Root orientation still carries the intended lean and heading. Constrain
+    # only the local torso chain so small joint noise cannot create a segmented,
+    # snake-like spine or an abruptly tilted neck.
+    for joint_idx, max_angle in ((3, 0.18), (6, 0.18), (9, 0.22), (12, 0.25)):
+        local_rot[:, joint_idx] = clamp_local_rotation(
+            local_rot[:, joint_idx], max_angle
+        )
+
+    local_rot = smooth_rotation_matrices(local_rot, IK_SMOOTH_WIN)
+
+    raw_model = LBS.get("raw_model")
+    if raw_model is not None:
+        betas = raw_model["betas"].view(1, 10).expand(frame_count, -1)
+        vertices, joints = _raw_lbs(
+            betas,
+            local_rot,
+            raw_model["v_template"],
+            raw_model["shapedirs"],
+            raw_model["posedirs"],
+            raw_model["J_regressor"],
+            raw_model["parents"],
+            raw_model["lbs_w"],
+            pose2rot=False,
+        )
+        transl = target_joints[:, 0] - joints[:, 0]
+        return vertices + transl[:, None]
+
+    shape_values = list(getattr(VISUAL_CFG, "SMPL_BODY_BETAS", [0.0] * 10))
+    betas = torch.as_tensor(
+        shape_values, device=device, dtype=target_joints.dtype
+    ).view(1, 10).expand(frame_count, -1)
+    smpl = _smpl_for(frame_count)
+    zero_transl = torch.zeros(frame_count, 3, device=device, dtype=target_joints.dtype)
+    initial = smpl(
+        global_orient=local_rot[:, :1], body_pose=local_rot[:, 1:],
+        betas=betas, transl=zero_transl, pose2rot=False,
+    )
+    transl = target_joints[:, 0] - initial.joints[:, 0]
+    output = smpl(
+        global_orient=local_rot[:, :1], body_pose=local_rot[:, 1:],
+        betas=betas, transl=transl, pose2rot=False,
+    )
+    return output.vertices
+
+
 def motion_init_pose(denorm):
     """從動作 263 特徵的 root 旋轉 + 21 個 rot6d 算出每幀 SMPL 72 維 axis-angle 初始姿勢(warm-start)。"""
     _rrp, _qinv, _q2m, _r6m, _m2aa = _init_pose_fns
@@ -286,6 +555,104 @@ def fit_smpl_own(target_joints, denorm, iters=None):
         opt.zero_grad(); loss.backward(); opt.step()
     with torch.no_grad():
         verts = smpl(global_orient=go, body_pose=bp, betas=betas.expand(F, 10), transl=transl).vertices
+    return verts
+
+
+def fit_smpl_high_quality(target_joints, denorm, iters=None):
+    """Constrained SMPL fitting with a fixed lean body and stable motion."""
+    iters = OWN_ITERS if iters is None else iters
+    frame_count = target_joints.shape[0]
+    smpl = _smpl_for(frame_count)
+    tgt = target_joints.detach()
+
+    init72 = motion_init_pose(denorm).detach() if WARM else torch.zeros(
+        frame_count, 72, device=device, dtype=tgt.dtype
+    )
+    go_init = init72[:, :3].clone()
+    bp_init = init72[:, 3:].clone()
+
+    shape_values = list(getattr(VISUAL_CFG, "SMPL_BODY_BETAS", [0.0] * 10))
+    if len(shape_values) != 10:
+        raise ValueError(f"SMPL_BODY_BETAS needs 10 values, got {len(shape_values)}")
+    betas = torch.as_tensor(shape_values, device=device, dtype=tgt.dtype).view(1, 10)
+    frame_betas = betas.expand(frame_count, -1)
+
+    # Initialize translation from the shaped pelvis instead of assuming that
+    # the SMPL pelvis is exactly at the template origin.
+    with torch.no_grad():
+        init_out = smpl(
+            global_orient=go_init,
+            body_pose=bp_init,
+            betas=frame_betas,
+            transl=torch.zeros_like(tgt[:, 0]),
+        )
+        transl_init = tgt[:, 0] - init_out.joints[:, 0]
+
+    # Optimize bounded residuals, not unrestricted axis angles. Even if the
+    # joint objective is imperfect, the fitter cannot twist far away from the
+    # valid pose produced by the motion model.
+    go_delta = torch.zeros_like(go_init, requires_grad=True)
+    bp_delta = torch.zeros_like(bp_init, requires_grad=True)
+    opt = torch.optim.Adam([go_delta, bp_delta], lr=0.05)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    started = time.perf_counter()
+
+    completed_iters = 0
+    for step in range(iters):
+        go = go_init + 0.20 * torch.tanh(go_delta)
+        bp = bp_init + 0.30 * torch.tanh(bp_delta)
+        out = smpl(global_orient=go, body_pose=bp, betas=frame_betas, transl=transl_init)
+        joints = out.joints[:, :22]
+        loss = 100.0 * ((joints - tgt) ** 2).sum(-1).mean()
+
+        # Prefer minimal corrections inside the already bounded search space.
+        loss = loss + 0.10 * (bp_delta ** 2).mean()
+        loss = loss + 0.05 * (go_delta ** 2).mean()
+
+        # Penalize acceleration, not velocity: this removes visible jitter
+        # without damping intentional walking/running speed.
+        if frame_count > 2:
+            bp_acc = bp[2:] - 2.0 * bp[1:-1] + bp[:-2]
+            go_acc = go[2:] - 2.0 * go[1:-1] + go[:-2]
+            loss = loss + 4.0 * (bp_acc ** 2).mean()
+            loss = loss + 1.0 * (go_acc ** 2).mean()
+        elif frame_count > 1:
+            loss = loss + 0.25 * ((bp[1:] - bp[:-1]) ** 2).mean()
+
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([go_delta, bp_delta], max_norm=1.0)
+        opt.step()
+        completed_iters = step + 1
+
+        # Spend the available latency budget on quality. CUDA work is
+        # asynchronous, so synchronize only every four iterations.
+        if completed_iters >= 8 and completed_iters % 4 == 0:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            if time.perf_counter() - started >= OWN_BUDGET:
+                break
+
+    with torch.no_grad():
+        go = go_init + 0.20 * torch.tanh(go_delta)
+        bp = bp_init + 0.30 * torch.tanh(bp_delta)
+        final_out = smpl(
+            global_orient=go,
+            body_pose=bp,
+            betas=frame_betas,
+            transl=transl_init,
+        )
+        verts = final_out.vertices
+        joint_rmse = ((final_out.joints[:, :22] - tgt) ** 2).sum(-1).mean().sqrt()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    print(
+        f"[mesh-own] frames={frame_count} iters={completed_iters}/{iters} "
+        f"fit={elapsed:.2f}s joint_rmse={joint_rmse.item():.4f}",
+        flush=True,
+    )
     return verts
 
 
@@ -398,6 +765,8 @@ def _run(text, length, source_id, p):
                 verts_t = lbs_vertices(joints_t)                                          # position-driven LBS(最快 + 真位移)
                 verts_t = taubin_smooth(verts_t, TAUBIN_ITERS)                            # 平順表面、淡化扭曲/重疊觀感
             elif MESH_MODE == "own":
+                verts_t = ik_smpl_vertices(joints_t)
+            elif MESH_MODE == "own_legacy":
                 verts_t = fit_smpl_own(joints_t, denorm)                                  # 自寫擬合(精準 + 真位移)
             elif MESH_MODE == "fit":
                 init_pose = motion_init_pose(denorm) if WARM else None
