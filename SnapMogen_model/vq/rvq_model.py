@@ -68,7 +68,7 @@ class HRVQVAE(nn.Module):
         x = x.permute(0, 2, 1)
         return x
 
-    def encode(self, x, m_lens=None):
+    def encode(self, x, m_lens=None, return_prequant=False):
         # N, T, _ = x.shape
         x_in = self.preprocess(x)
         x_encoder = self.encoder(x_in, m_lens)
@@ -81,6 +81,8 @@ class HRVQVAE(nn.Module):
         # code_idx = code_idx.view(N, -1)
         # (N, T, Q)
         # print()
+        if return_prequant:
+            return code_idx, all_codes, x_encoder.permute(0, 2, 1)
         return code_idx, all_codes
 
     def forward(self, x, m_lengths=None):

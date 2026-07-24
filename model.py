@@ -433,6 +433,76 @@ class VAMotion(nn.Module):
         logits = torch.einsum("bld,kd->blk", z_norm, code_norm) / self.delta_temp
         return logits.transpose(1, 2)   # [B, code, L]
 
+    def rvq_reencode_logits(self, final_latent, flat_valid_mask=None):
+        """Re-quantize a full latent and return logits for every RVQ scale."""
+        full_t = self.patch_sizes[-1]
+        if final_latent.shape[1] != full_t:
+            raise ValueError(
+                f"Expected final latent length {full_t}, got {final_latent.shape[1]}"
+            )
+
+        codebook = self.get_vq_codebook(final_latent.device, final_latent.dtype)
+        quantizer = object.__getattribute__(self, "_vq_quantizer_ref")
+        if quantizer is None and abs(float(getattr(self.cfg.vq, "quant_resi", 0.0))) > 1e-6:
+            raise RuntimeError(
+                "Scale-wise RVQ re-encoding requires set_vq_quantizer() when "
+                "the quant_resi path is non-identity."
+            )
+
+        if flat_valid_mask is None:
+            level_masks = [
+                torch.ones(
+                    final_latent.shape[0],
+                    patch_size,
+                    dtype=torch.bool,
+                    device=final_latent.device,
+                )
+                for patch_size in self.patch_sizes
+            ]
+        else:
+            expected_len = sum(self.patch_sizes)
+            if flat_valid_mask.shape[1] != expected_len:
+                raise ValueError(
+                    f"Expected flattened valid-mask length {expected_len}, "
+                    f"got {flat_valid_mask.shape[1]}"
+                )
+            level_masks = list(torch.split(flat_valid_mask.bool(), self.patch_sizes, dim=1))
+
+        residual = final_latent.transpose(1, 2)
+        full_valid = level_masks[-1]
+        logits_by_scale = []
+
+        for level, (patch_size, level_valid) in enumerate(zip(self.patch_sizes, level_masks)):
+            residual = residual * full_valid.unsqueeze(1)
+            rest_down = (
+                residual
+                if patch_size == full_t
+                else F.interpolate(residual, size=patch_size, mode="area")
+            )
+            candidates = rest_down.transpose(1, 2)
+            distance = (
+                candidates.square().sum(dim=-1, keepdim=True)
+                - 2.0 * torch.matmul(candidates, codebook.t())
+                + codebook.square().sum(dim=-1).view(1, 1, -1)
+            )
+            level_logits = -distance / max(self.delta_temp, 1e-6)
+            logits_by_scale.append(level_logits)
+
+            # Mirror the frozen RVQ encoder: choose one token at this scale,
+            # reconstruct its contribution, and remove it from the residual.
+            predicted_ids = level_logits.argmax(dim=-1)
+            level_codes = F.embedding(predicted_ids, codebook)
+            level_codes = level_codes.masked_fill(~level_valid.unsqueeze(-1), 0.0)
+            contribution = F.interpolate(
+                level_codes.transpose(1, 2), size=full_t, mode="linear"
+            )
+            if quantizer is not None and len(self.scales) > 1:
+                ratio = level / (len(self.scales) - 1)
+                contribution = quantizer.quant_resi[ratio](contribution)
+            residual = residual - contribution
+
+        return torch.cat(logits_by_scale, dim=1).transpose(1, 2)
+
     def run_delta_branch(self, transformer_input, text_cross, source_cross, aligned_src_ids,
                          target_mask, padding_mask, delta_active, need_latent=True):
         # extra edit path, silent for gen/null-text samples
@@ -444,7 +514,9 @@ class VAMotion(nn.Module):
             return None, None, None, None
 
         valid = target_mask.bool() & active.squeeze(-1)
-        z_src = self.vq_latents(aligned_src_ids, valid)
+        z_src, z_src_final = self.vq_latents(
+            aligned_src_ids, valid, return_final=True
+        )
         z_src_proj = self.delta_code_proj(z_src)
         delta_control = torch.cat([transformer_input, text_cross, source_cross, z_src_proj], dim=-1)
         delta_control = self.delta_control_proj(delta_control)
@@ -452,19 +524,20 @@ class VAMotion(nn.Module):
         delta_residuals, delta_hiddens = self.delta_encoder(
             transformer_input, delta_control, cond=text_cross, padding_mask=padding_mask, return_hiddens=True
         )
-        delta_pred = self.delta_head(delta_hiddens[-1]) * active.float()
+        delta_pred_all = self.delta_head(delta_hiddens[-1]) * active.float()
 
         pred_z = None
+        delta_pred = None
         latent_res_logits = None
         if need_latent or self.delta_alpha != 0.0:
-            pred_z = z_src + delta_pred
-            # A cumulative HRVQ latent cannot be compared to the raw codebook
-            # table without undoing all earlier residual scales. Keep token CE
-            # in the main MaskGIT head and supervise this path continuously.
+            full_t = self.patch_sizes[-1]
+            delta_pred = delta_pred_all[:, -full_t:]
+            pred_z = z_src_final + delta_pred
+            # Re-quantization is auxiliary and does not bias main token logits.
             if self.delta_alpha != 0.0:
                 raise ValueError(
-                    "model.delta_alpha must remain 0 when using composed HRVQ latents; "
-                    "raw-codebook residual logits are not defined in this space."
+                    "model.delta_alpha must remain 0; the VQ-latent CE is an "
+                    "auxiliary loss and is not added to main token logits."
                 )
         return delta_residuals, latent_res_logits, pred_z, delta_pred
 
@@ -576,7 +649,8 @@ class VAMotion(nn.Module):
         return loss, ((gap_a + gap_b) * 0.5).mean()
 
     def vq_delta_losses(self, pred_z, delta_pred, target_ids, source_ids,
-                        target_mask, predict_mask, active_edit):
+                        target_mask, predict_mask, active_edit,
+                        target_prequant=None):
         zero = self.token_emb.weight.new_tensor(0.0)
         if pred_z is None or delta_pred is None:
             return zero, zero, zero
@@ -588,14 +662,26 @@ class VAMotion(nn.Module):
         if valid.sum() == 0:
             return zero, zero, zero
 
-        # Compose the complete source/target sequence first. predict_mask is a
-        # loss mask, not part of the RVQ reconstruction path.
+        # Compose complete source/target latents on the finest timeline.
         compose_valid = target_mask.bool() & active
-        z_src = self.vq_latents(source_ids, compose_valid)
-        z_tgt = self.vq_latents(target_ids, compose_valid)
+        _, z_src = self.vq_latents(source_ids, compose_valid, return_final=True)
+        full_t = self.patch_sizes[-1]
+        final_compose_valid = compose_valid[:, -full_t:]
+        if target_prequant is None:
+            _, z_tgt = self.vq_latents(target_ids, compose_valid, return_final=True)
+        else:
+            if target_prequant.shape[1:] != (full_t, z_src.shape[-1]):
+                raise ValueError(
+                    "Expected target pre-quantization latent shape "
+                    f"[B, {full_t}, {z_src.shape[-1]}], got "
+                    f"{list(target_prequant.shape)}"
+                )
+            z_tgt = target_prequant.to(device=z_src.device, dtype=z_src.dtype)
+            z_tgt = z_tgt.masked_fill(~final_compose_valid.unsqueeze(-1), 0.0)
         gt_delta = (z_tgt - z_src).detach()
 
-        weight = valid.float()
+        final_valid = valid[:, -full_t:]
+        weight = final_valid.float()
         delta_dist = F.smooth_l1_loss(delta_pred, gt_delta, reduction="none").mean(dim=-1)
         delta_loss = (delta_dist * weight).sum() / weight.sum().clamp(min=1.0)
 
@@ -604,9 +690,15 @@ class VAMotion(nn.Module):
         src_n = F.normalize(z_src.detach(), dim=-1)
         dist_tgt = 1.0 - (pred_n * tgt_n).sum(dim=-1)
         dist_src = 1.0 - (pred_n * src_n).sum(dim=-1)
-        # Continuous endpoint alignment in the same cumulative latent space as
-        # the frozen HRVQ decoder. This replaces the old, mismatched raw-code CE.
-        latent_loss = (dist_tgt * weight).sum() / weight.sum().clamp(min=1.0)
+
+        # Re-quantize the predicted full latent scale by scale and supervise
+        # each set of logits with its corresponding target RVQ token.
+        latent_logits = self.rvq_reencode_logits(pred_z, compose_valid)
+        labels = torch.where(valid, target_ids, self.mask_id)
+        latent_loss = F.cross_entropy(
+            latent_logits, labels, ignore_index=self.mask_id
+        )
+
         margin = float(getattr(self.cfg.loss, "delta_rank_margin", 0.2))
         rank_dist = F.relu(margin + dist_tgt - dist_src)
         rank_loss = (rank_dist * weight).sum() / weight.sum().clamp(min=1.0)
@@ -686,6 +778,7 @@ class VAMotion(nn.Module):
         return mask 
 
     def forward(self, target_input, source_input, text_input, m_lens, has_source, source_m_lens=None,
+                target_prequant=None,
                 same_src_text=None, same_src_flag=None,
                 same_target_input=None, same_m_lens=None):
         # target/source input are both multi-scale VQ ids
@@ -811,7 +904,8 @@ class VAMotion(nn.Module):
 
         delta_loss, latent_loss, rank_loss = self.vq_delta_losses(
             pred_z, delta_pred, target_ids, aligned_src_ids,
-            target_mask, predict_mask, active_edit
+            target_mask, predict_mask, active_edit,
+            target_prequant=target_prequant
         )
         null_gain_loss = raw_logits.new_tensor(0.0)
         null_gain_gap = raw_logits.new_tensor(0.0)

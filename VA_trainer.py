@@ -216,7 +216,11 @@ class VA_motion_trainer:
         has_source = has_source.detach().long().to(self.device)
 
         # VQ encode with own len
-        target_code_idx, _ = self.vq_model.encode(tgt_motion[..., :self.config.data.dim_pose], m_length)
+        target_code_idx, _, target_prequant = self.vq_model.encode(
+            tgt_motion[..., :self.config.data.dim_pose],
+            m_length,
+            return_prequant=True,
+        )
         source_code_idx, _ = self.vq_model.encode(src_motion[..., :self.config.data.dim_pose], src_m_length)
         m_lens = m_length // self.config.data.unit_length
         src_m_lens = src_m_length // self.config.data.unit_length
@@ -237,7 +241,7 @@ class VA_motion_trainer:
 
         _loss, loss_mt, delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, _acc = self.training_model(
             target_code_idx, source_code_idx, caption, m_lens, has_source,
-            source_m_lens=src_m_lens,
+            source_m_lens=src_m_lens, target_prequant=target_prequant,
             same_src_text=same_src_text, same_src_flag=same_src_flag,
             same_target_input=same_target_code_idx, same_m_lens=same_m_lens
         )
