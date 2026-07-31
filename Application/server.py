@@ -74,21 +74,38 @@ print(f"[boot] ready on {device} · unit={UNIT} · dim={DIM} · fps={FPS}", flus
 # MESH_MODE=lbs      : position-driven LBS(快速 fallback)。用 22 關節位置直接把 SMPL 皮膚變形貼合，
 #                      無 per-frame 優化。① SMPL pose blendshape 補回關節體積 ④ 沿骨軸伸縮消關節縫隙。
 #                      四肢 twist 不從位置猜(forearm 等 roll 不可觀測，硬解反而扭曲)→ 用乾淨 swing。
-# MESH_MODE=own(預設): minimum-twist IK + 官方 SMPL skinning；固定精瘦身形，不拉扯表面。
-# MESH_MODE=fit      : visualize 的 joints2smpl SMPLify(保留對照)。
+# MESH_MODE=own(預設): minimum-twist IK + 官方 SMPL skinning；固定精瘦男性身形。
+# MESH_MODE=fit      : visualize 的 joints2smpl SMPLify(離線品質對照，較慢)。
 # MESH_MODE=fast     : rot6d 直接前向(免優化，會扭曲，不建議)。
 # MESH_MODE=metaball : 回傳關節點，前端 metaball 皮膚(不碰 SMPL)。
 MESH_MODE   = os.environ.get("MESH_MODE", "own").lower()
 OWN_ITERS   = int(os.environ.get("OWN_ITERS", "48"))
 OWN_BUDGET  = float(os.environ.get("OWN_BUDGET", "2.8")) # fitting time budget in seconds
-SMPL_ITERS  = int(os.environ.get("SMPL_ITERS", "8"))    # fit 模式 warm-start 後迭代
+SMPL_ITERS  = int(os.environ.get("SMPL_ITERS", "8"))
 SMPL_STRIDE = int(os.environ.get("SMPL_STRIDE", "1"))
-WARM        = os.environ.get("WARM", "1") != "0"        # 用動作旋轉當初始姿勢(warm-start)
+WARM        = os.environ.get("WARM", "1") != "0"
+TORSO_POSE_CORRECTIVE_SCALE = float(
+    np.clip(float(os.environ.get("TORSO_POSE_CORRECTIVE_SCALE", "0.35")), 0.0, 1.0)
+)
+TORSO_PROFILE_FLATTEN = float(
+    np.clip(float(os.environ.get("TORSO_PROFILE_FLATTEN", "1.0")), 0.0, 1.5)
+)
+VLINE_TAPER = float(
+    np.clip(float(os.environ.get("VLINE_TAPER", "0.05")), 0.0, 0.10)
+)
+ATHLETIC_SHOULDER_GAIN = float(
+    np.clip(float(os.environ.get("ATHLETIC_SHOULDER_GAIN", "0.025")), 0.0, 0.05)
+)
+ALLOW_METABALL_FALLBACK = os.environ.get("ALLOW_METABALL_FALLBACK", "0") == "1"
 LBS_POSE_BS = os.environ.get("LBS_POSE_BS", "1") != "0" # ① pose blendshape(補關節體積，實測有效)
 LBS_STRETCH = os.environ.get("LBS_STRETCH", "1") != "0" # ④ 沿骨軸伸縮(消關節縫隙)
-SMOOTH_WIN  = int(os.environ.get("SMOOTH_WIN", "2"))    # 關節時間平滑半徑(減少抖動；0=關)
+SMOOTH_WIN  = int(os.environ.get("SMOOTH_WIN", "0"))    # 關節時間平滑半徑(減少抖動；0=關)
 TAUBIN_ITERS= int(os.environ.get("TAUBIN_ITERS", "2"))  # 網格 Taubin 平滑迭代(減少表面扭曲/重疊觀感；0=關)
-IK_SMOOTH_WIN = int(os.environ.get("IK_SMOOTH_WIN", "3"))
+IK_SMOOTH_WIN = int(os.environ.get("IK_SMOOTH_WIN", "1"))
+POSE_REFINE_ITERS = max(0, int(os.environ.get("POSE_REFINE_ITERS", "4")))
+POSE_REFINE_BUDGET = max(
+    0.0, float(os.environ.get("POSE_REFINE_BUDGET", "0.45"))
+)
 NEED_SMPL = MESH_MODE in ("lbs", "own", "fit", "fast")
 MESH_OK = False
 FACES = np.zeros((0, 3), np.int64)
@@ -98,7 +115,10 @@ fit_vertices = proxy_vertices = _init_pose_fns = None
 if NEED_SMPL:
     try:
         import smplx as _smplx
-        from smplx.lbs import lbs as _raw_lbs
+        from smplx.lbs import (
+            batch_rigid_transform as _batch_rigid_transform,
+            lbs as _raw_lbs,
+        )
         # warm-start 用的旋轉轉換(與 motion_to_proxy_vertices 同慣例)
         from utils.motion_process_bvh import recover_root_rot_pos as _rrp
         from utils.common.quaternion import qinv as _qinv
@@ -184,6 +204,52 @@ if NEED_SMPL:
                     "vcn,n->vc", male_shapedirs, male_betas
                     )
                 )
+                # Joint positions do not constrain the torso surface. Preserve
+                # the accepted v5 male template, but damp pose correctives only
+                # on vertices governed by pelvis/spine/neck joints. This avoids
+                # animated chest/abdomen dents without smoothing limbs or adding
+                # any per-request optimization.
+                torso_weight = lbs_w[:, [0, 3, 6, 9, 12]].sum(dim=-1)
+                torso_blend = ((torso_weight - 0.20) / 0.60).clamp(0.0, 1.0)
+                torso_blend = torso_blend * torso_blend * (3.0 - 2.0 * torso_blend)
+                frontness = ((v_template[:, 2] + 0.01) / 0.12).clamp(0.0, 1.0)
+                frontness = frontness * frontness * (3.0 - 2.0 * frontness)
+                abdomen = torch.exp(
+                    -0.5 * ((v_template[:, 1] + 0.28) / 0.13) ** 2
+                )
+                chest = torch.exp(
+                    -0.5 * ((v_template[:, 1] + 0.02) / 0.10) ** 2
+                )
+                profile_offset = TORSO_PROFILE_FLATTEN * (
+                    0.028 * abdomen + 0.010 * chest
+                ) * frontness * torso_blend
+                v_template[:, 2] = v_template[:, 2] - profile_offset
+                # Tighten only the lower-torso V-line in the fixed rest
+                # template. The smooth height and skinning-weight masks leave
+                # hips, legs, chest, arms, and all per-frame motion unchanged.
+                vline = torch.exp(
+                    -0.5 * ((v_template[:, 1] + 0.31) / 0.09) ** 2
+                )
+                waist_scale = 1.0 - VLINE_TAPER * vline * torso_blend
+                v_template[:, 0] = v_template[:, 0] * waist_scale
+                # Add a restrained shoulder V-taper without increasing chest
+                # depth. The skinning and height masks exclude waist and hips.
+                upper_weight = lbs_w[:, [9, 12, 13, 14, 16, 17]].sum(dim=-1)
+                upper_blend = ((upper_weight - 0.15) / 0.65).clamp(0.0, 1.0)
+                upper_blend = upper_blend * upper_blend * (3.0 - 2.0 * upper_blend)
+                shoulder_height = torch.exp(
+                    -0.5 * ((v_template[:, 1] - 0.055) / 0.105) ** 2
+                )
+                shoulder_scale = (
+                    1.0 + ATHLETIC_SHOULDER_GAIN * upper_blend * shoulder_height
+                )
+                v_template[:, 0] = v_template[:, 0] * shoulder_scale
+                corrective_scale = 1.0 - (
+                    1.0 - TORSO_POSE_CORRECTIVE_SCALE
+                ) * torso_blend
+                male_posedirs = male_posedirs * corrective_scale.repeat_interleave(
+                    3
+                ).unsqueeze(0)
                 J_rest = J_regressor @ v_template
                 raw_model = dict(
                     v_template=v_template,
@@ -220,18 +286,34 @@ if NEED_SMPL:
             VIS_CFG = load_config(pjoin(ROOT, "configs", "visualize_motion_editing_hml.yaml"))
             VIS_CFG.smpl_fit_iters = SMPL_ITERS
             VIS_CFG.smpl_fit_sample_stride = SMPL_STRIDE
-            VIS_CFG.max_frames = MAXL
             SMPL_MODEL = _SMPL(VISUAL_CFG, model_path=pjoin(SMPL_DIR, "smpl")).eval().to(device)
             fit_vertices, proxy_vertices = _fit, _proxy
         MESH_OK = True
         detail = {"lbs": f"pose_bs={int(LBS_POSE_BS)} stretch={int(LBS_STRETCH)}",
-                  "own": "minimum-twist IK + male SMPL-X core"}.get(
+                  "own": (
+                      "minimum-twist IK + v5 male SMPL-X "
+                      f"torso_corrective={TORSO_POSE_CORRECTIVE_SCALE:.2f} "
+                      f"vline_taper={VLINE_TAPER:.2f} "
+                      f"shoulder_gain={ATHLETIC_SHOULDER_GAIN:.3f} "
+                      f"pose_refine={POSE_REFINE_ITERS}"
+                  ),
+                  "fit": f"visualize joints2smpl/SMPLify iters={SMPL_ITERS} stride={SMPL_STRIDE}"}.get(
                       MESH_MODE, f"iters={SMPL_ITERS} stride={SMPL_STRIDE}"
                   )
         print(f"[boot] SMPL mesh ON · mode={MESH_MODE} warm={WARM} · faces={FACES.shape[0]} · {detail}", flush=True)
     except Exception as e:
         MESH_OK = False
-        print(f"[boot] SMPL mesh OFF ({type(e).__name__}: {e}) → 回傳關節點，前端改用 metaball", flush=True)
+        if ALLOW_METABALL_FALLBACK:
+            print(
+                f"[boot] SMPL mesh OFF ({type(e).__name__}: {e}) "
+                "→ debugging fallback uses metaball",
+                flush=True,
+            )
+        else:
+            raise RuntimeError(
+                "SMPL mesh initialization failed. Refusing the clay/metaball "
+                "fallback; set ALLOW_METABALL_FALLBACK=1 only for debugging."
+            ) from e
 else:
     print("[boot] mesh mode = metaball（回傳關節點，前端 metaball 皮膚）", flush=True)
 
@@ -335,7 +417,7 @@ def smooth_rotation_matrices(rotations, radius):
 
     quaternions = _m2q(rotations)
     aligned = [quaternions[0]]
-    max_step = 0.30
+    max_step = 0.50
     for frame_idx in range(1, frame_count):
         current = quaternions[frame_idx]
         sign = torch.where(
@@ -494,7 +576,17 @@ def ik_smpl_vertices(target_joints):
             pose2rot=False,
         )
         transl = target_joints[:, 0] - joints[:, 0]
-        return vertices + transl[:, None]
+        base_vertices = vertices + transl[:, None]
+        base_joints = joints + transl[:, None]
+        if POSE_REFINE_ITERS > 0:
+            return refine_male_pose(
+                target_joints,
+                local_rot,
+                base_vertices,
+                base_joints,
+                raw_model,
+            )
+        return base_vertices
 
     shape_values = list(getattr(VISUAL_CFG, "SMPL_BODY_BETAS", [0.0] * 10))
     betas = torch.as_tensor(
@@ -512,6 +604,244 @@ def ik_smpl_vertices(target_joints):
         betas=betas, transl=transl, pose2rot=False,
     )
     return output.vertices
+
+
+def refine_male_pose(
+    target_joints,
+    base_rotations,
+    base_vertices,
+    base_joints,
+    raw_model,
+):
+    """Apply a bounded pose-only refinement and keep the fixed male shape."""
+    frame_count = target_joints.shape[0]
+    if frame_count < 3:
+        return base_vertices
+
+    # These joints have observable child-bone directions in the HML skeleton.
+    # End effectors remain frozen because their twist cannot be recovered from
+    # joint positions and is the main source of visibly distorted limbs.
+    refined_joint_ids = torch.as_tensor(
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 16, 17, 18, 19],
+        device=target_joints.device,
+        dtype=torch.long,
+    )
+    max_degrees = torch.as_tensor(
+        [2.0, 3.0, 3.0, 2.0, 4.0, 4.0, 2.0, 3.0, 3.0,
+         2.5, 2.0, 2.5, 2.5, 3.0, 3.0, 4.0, 4.0],
+        device=target_joints.device,
+        dtype=target_joints.dtype,
+    )
+    max_radians = torch.deg2rad(max_degrees).view(1, -1, 1)
+    target = target_joints.detach()
+    base_rotations = base_rotations.detach()
+    rest_joints = LBS["J_rest"].detach().view(
+        1, -1, 3
+    ).expand(frame_count, -1, -1)
+    parents = raw_model["parents"]
+
+    control_stride = 2
+    control_count = max(2, (frame_count - 1 + control_stride - 1) // control_stride + 1)
+    delta_params = torch.zeros(
+        control_count,
+        refined_joint_ids.numel(),
+        3,
+        device=target_joints.device,
+        dtype=target_joints.dtype,
+        requires_grad=True,
+    )
+    first_moment = torch.zeros_like(delta_params)
+    second_moment = torch.zeros_like(delta_params)
+    started = time.perf_counter()
+
+    def interpolate_delta(params):
+        signal = params.permute(1, 2, 0).reshape(
+            1, refined_joint_ids.numel() * 3, control_count
+        )
+        signal = torch.nn.functional.interpolate(
+            signal,
+            size=frame_count,
+            mode="linear",
+            align_corners=True,
+        )
+        return signal.reshape(
+            refined_joint_ids.numel(), 3, frame_count
+        ).permute(2, 0, 1)
+
+    def pose_from_delta(params):
+        delta_axis_angle = torch.tanh(interpolate_delta(params)) * max_radians
+        delta_rotation = _aa2m(delta_axis_angle)
+        candidate = base_rotations.clone()
+        candidate[:, refined_joint_ids] = torch.matmul(
+            base_rotations[:, refined_joint_ids], delta_rotation
+        )
+        return candidate, delta_axis_angle
+
+    def posed_joints(candidate):
+        joints, _ = _batch_rigid_transform(
+            candidate,
+            rest_joints,
+            parents,
+            dtype=target_joints.dtype,
+        )
+        translation = target[:, :1] - joints[:, :1]
+        return joints + translation
+
+    base_visible_joints = base_joints[:, :22]
+    base_rmse = torch.linalg.norm(
+        base_visible_joints - target, dim=-1
+    ).mean()
+    target_acceleration = (
+        target[2:] - 2.0 * target[1:-1] + target[:-2]
+    )
+
+    def acceleration_residual(joints):
+        acceleration = joints[2:] - 2.0 * joints[1:-1] + joints[:-2]
+        return torch.linalg.norm(
+            acceleration - target_acceleration, dim=-1
+        ).mean()
+
+    base_temporal_error = acceleration_residual(base_visible_joints)
+    best_params = delta_params.detach().clone()
+    best_rmse = base_rmse.detach().clone()
+    best_temporal_error = base_temporal_error.detach().clone()
+    best_score = best_rmse + 0.25 * best_temporal_error
+
+    with torch.enable_grad():
+        for refine_step in range(1, POSE_REFINE_ITERS + 1):
+            candidate, delta_axis_angle = pose_from_delta(delta_params)
+            predicted = posed_joints(candidate)[:, :22]
+
+            joint_loss = torch.nn.functional.smooth_l1_loss(
+                predicted,
+                target,
+                beta=0.015,
+            )
+            pred_bones = predicted[:, 1:] - predicted[:, parents[1:22]]
+            target_bones = target[:, 1:] - target[:, parents[1:22]]
+            pred_bones = pred_bones / pred_bones.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            target_bones = target_bones / target_bones.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-8)
+            direction_loss = (
+                1.0 - (pred_bones * target_bones).sum(dim=-1)
+            ).mean()
+
+            normalized_delta = delta_axis_angle / max_radians
+            trust_loss = normalized_delta.square().mean()
+            velocity_loss = (
+                delta_axis_angle[1:] - delta_axis_angle[:-1]
+            ).square().mean()
+            if frame_count > 2:
+                acceleration_loss = (
+                    delta_axis_angle[2:]
+                    - 2.0 * delta_axis_angle[1:-1]
+                    + delta_axis_angle[:-2]
+                ).square().mean()
+            else:
+                acceleration_loss = delta_axis_angle.new_zeros(())
+
+            loss = (
+                4.0 * joint_loss
+                + 0.25 * direction_loss
+                + 0.02 * trust_loss
+                + 2.0 * velocity_loss
+                + 4.0 * acceleration_loss
+            )
+            gradient = torch.autograd.grad(loss, delta_params)[0]
+            gradient_norm = torch.linalg.vector_norm(gradient)
+            gradient = gradient * torch.clamp(
+                0.5 / gradient_norm.clamp_min(1e-8), max=1.0
+            )
+            with torch.no_grad():
+                first_moment.mul_(0.9).add_(gradient, alpha=0.1)
+                second_moment.mul_(0.999).addcmul_(
+                    gradient, gradient, value=0.001
+                )
+                first_unbiased = first_moment / (1.0 - 0.9 ** refine_step)
+                second_unbiased = second_moment / (
+                    1.0 - 0.999 ** refine_step
+                )
+                delta_params.addcdiv_(
+                    first_unbiased,
+                    second_unbiased.sqrt().add_(1e-8),
+                    value=-0.15,
+                )
+
+            with torch.no_grad():
+                step_rotations, _ = pose_from_delta(delta_params)
+                step_joints = posed_joints(step_rotations)[:, :22]
+                step_rmse = torch.linalg.norm(
+                    step_joints - target, dim=-1
+                ).mean()
+                step_temporal_error = acceleration_residual(step_joints)
+                step_score = step_rmse + 0.25 * step_temporal_error
+                temporally_safe = (
+                    step_temporal_error
+                    <= base_temporal_error * 1.10 + 5e-4
+                )
+                if bool(temporally_safe and step_score < best_score):
+                    best_params.copy_(delta_params.detach())
+                    best_rmse.copy_(step_rmse)
+                    best_temporal_error.copy_(step_temporal_error)
+                    best_score.copy_(step_score)
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            if time.perf_counter() - started >= POSE_REFINE_BUDGET:
+                break
+
+    with torch.no_grad():
+        refined_rotations, _ = pose_from_delta(best_params)
+        refined_joints = posed_joints(refined_rotations)
+        refined_rmse = torch.linalg.norm(
+            refined_joints[:, :22] - target, dim=-1
+        ).mean()
+        refined_temporal_error = acceleration_residual(
+            refined_joints[:, :22]
+        )
+        accept = (
+            refined_rmse + 1e-5 < base_rmse
+            and refined_temporal_error
+            <= base_temporal_error * 1.10 + 5e-4
+        )
+        if not bool(accept):
+            print(
+                "[mesh-refine] rejected; preserving original fixed-male mesh "
+                f"rmse={base_rmse.item():.4f}->{refined_rmse.item():.4f} "
+                "temporal_error="
+                f"{base_temporal_error.item():.4f}->"
+                f"{refined_temporal_error.item():.4f}",
+                flush=True,
+            )
+            return base_vertices
+
+        betas = raw_model["betas"].view(1, 10).expand(frame_count, -1)
+        vertices, joints = _raw_lbs(
+            betas,
+            refined_rotations,
+            raw_model["v_template"],
+            raw_model["shapedirs"],
+            raw_model["posedirs"],
+            raw_model["J_regressor"],
+            raw_model["parents"],
+            raw_model["lbs_w"],
+            pose2rot=False,
+        )
+        translation = target[:, :1] - joints[:, :1]
+        elapsed = time.perf_counter() - started
+        print(
+            "[mesh-refine] accepted fixed-male pose refinement "
+            f"rmse={base_rmse.item():.4f}->{refined_rmse.item():.4f} "
+            "temporal_error="
+            f"{base_temporal_error.item():.4f}->"
+            f"{refined_temporal_error.item():.4f} "
+            f"time={elapsed:.3f}s",
+            flush=True,
+        )
+        return vertices + translation
 
 
 def motion_init_pose(denorm):
@@ -681,6 +1011,27 @@ def smooth_joints_time(joints, win):
     return y.view(joints.shape[1], 3, L).permute(2, 0, 1).contiguous()
 
 
+def fit_vertices_like_visualize(joints, init_pose=None):
+    """Fit raw joints in the same batch size used by the offline visualizer."""
+    chunk_frames = max(1, int(getattr(VIS_CFG, "max_frames", 60)))
+    vertex_chunks = []
+    joint_chunks = []
+    for start in range(0, joints.shape[0], chunk_frames):
+        end = min(start + chunk_frames, joints.shape[0])
+        chunk_init = init_pose[start:end] if init_pose is not None else None
+        vertices, fitted_joints = fit_vertices(
+            joints[start:end],
+            VISUAL_CFG,
+            VIS_CFG,
+            device,
+            label=f"Application {start}:{end}",
+            init_pose=chunk_init,
+        )
+        vertex_chunks.append(vertices)
+        joint_chunks.append(fitted_joints)
+    return torch.cat(vertex_chunks, dim=0), torch.cat(joint_chunks, dim=0)
+
+
 _MESH_ADJ = None
 def _mesh_adj(N):
     """由 FACES 建無向鄰接(雙向邊 index + 每點度數)，快取一次。"""
@@ -758,8 +1109,10 @@ def _run(text, length, source_id, p):
         # 保存這次產出的『原始 token』本身（含被編輯後的結果），供之後的 edit 直接當 source
         CACHE[mid] = {"mids": [s.detach().cpu() for s in mids], "len": int(m_len.item())}
         denorm = denorm_motion(pred, mean, std, pred.shape[0], device)                    # [1, L, 263]
-        joints_t = motion_to_joints(denorm, cfg.data.joint_num)                           # [L, 22, 3]
-        joints_t = smooth_joints_time(joints_t, SMOOTH_WIN)                               # 減少抖動(時間平滑)
+        raw_joints_t = motion_to_joints(denorm, cfg.data.joint_num)                       # [L, 22, 3]
+        joints_t = raw_joints_t if MESH_MODE == "fit" else smooth_joints_time(
+            raw_joints_t, SMOOTH_WIN
+        )
         if MESH_OK:
             if MESH_MODE == "lbs":
                 verts_t = lbs_vertices(joints_t)                                          # position-driven LBS(最快 + 真位移)
@@ -770,7 +1123,7 @@ def _run(text, length, source_id, p):
                 verts_t = fit_smpl_own(joints_t, denorm)                                  # 自寫擬合(精準 + 真位移)
             elif MESH_MODE == "fit":
                 init_pose = motion_init_pose(denorm) if WARM else None
-                verts_t, _ = fit_vertices(joints_t, VISUAL_CFG, VIS_CFG, device, init_pose=init_pose)
+                verts_t, _ = fit_vertices_like_visualize(joints_t, init_pose=init_pose)
             else:
                 verts_t, _, _ = proxy_vertices(denorm, joints_t, SMPL_MODEL, VIS_CFG, device)
             return mid, "mesh", _ground(verts_t.detach().cpu().numpy())

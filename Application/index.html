@@ -6,9 +6,9 @@
 <title>VAMotion · 互動展示</title>
 <style>
   :root{
-    --bg:#0c0f13; --panel:#12161c; --panel2:#161c24; --line:#232b35;
-    --ink:#e8eef4; --muted:#8a97a5; --accent:#2fb6c4; --accent-d:#1c8794;
-    --edit:#e0954a; --gen:#5fce8e; --danger:#e05a5a;
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f5; --line:#cfd7df;
+    --ink:#1c2934; --muted:#687785; --accent:#168d9b; --accent-d:#0f707c;
+    --edit:#c7792b; --gen:#27865c; --danger:#c94f4f;
     --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
     --sans:system-ui,-apple-system,"Segoe UI",Roboto,"PingFang TC","Microsoft JhengHei",sans-serif;
   }
@@ -45,7 +45,7 @@
   .empty-h{color:var(--muted);font-size:13px;text-align:center;padding:40px 24px;line-height:1.6}
   .node{position:absolute;display:flex;align-items:center;gap:9px;cursor:pointer;
     padding:5px 10px;border-radius:8px;transition:background .12s}
-  .node:hover{background:rgba(255,255,255,.04)}
+  .node:hover{background:rgba(20,35,48,.06)}
   .node .glyph{width:14px;height:14px;border-radius:50%;border:2px solid var(--edit);background:var(--panel);flex:none}
   .node.root .glyph{border-color:var(--gen)}
   .node.cur .glyph{background:var(--edit);box-shadow:0 0 10px var(--edit)}
@@ -57,7 +57,7 @@
   /* bottom control bar */
   #bar{position:absolute;left:0;right:300px;bottom:0;z-index:5;padding:16px 22px 20px;
     display:flex;flex-direction:column;gap:12px;
-    background:linear-gradient(0deg,rgba(10,12,15,.92),rgba(10,12,15,0))}
+    background:linear-gradient(0deg,rgba(246,248,250,.96),rgba(246,248,250,0))}
   .row{display:flex;gap:12px;align-items:center;max-width:760px;margin:0 auto;width:100%}
   .toggle{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;flex:none}
   .toggle button{background:none;border:none;color:var(--muted);font-family:var(--mono);font-size:12px;
@@ -92,13 +92,12 @@
   #caption.gen .tag{background:var(--gen);color:#08130c}
   #caption.edit .tag{background:var(--edit);color:#1a1206}
   #caption .cap-txt{font-size:14.5px;color:var(--ink);line-height:1.4;padding-top:1px;
-    overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;
-    text-shadow:0 1px 3px rgba(0,0,0,.6)}
+    overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
   #caption .cap-txt small{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-left:8px}
 
   /* loading */
   #load{position:absolute;inset:0;z-index:8;display:none;align-items:center;justify-content:center;
-    flex-direction:column;gap:16px;background:rgba(8,10,13,.55);backdrop-filter:blur(2px)}
+    flex-direction:column;gap:16px;background:rgba(246,248,250,.72);backdrop-filter:blur(2px)}
   #load.show{display:flex}
   .spin{width:38px;height:38px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;
     animation:sp 0.8s linear infinite}
@@ -123,7 +122,7 @@
   #params label.chk{flex-direction:row;align-items:center;gap:8px;color:var(--ink);font-size:12px}
   #params label.chk input{accent-color:var(--accent)}
 
-  .hint{position:absolute;bottom:8px;left:22px;z-index:5;font-family:var(--mono);font-size:10.5px;color:#4a5563;pointer-events:none}
+  .hint{position:absolute;bottom:8px;left:22px;z-index:5;font-family:var(--mono);font-size:10.5px;color:#72808d;pointer-events:none}
 </style>
 <script type="importmap">
 { "imports":{
@@ -207,13 +206,13 @@ const renderer = new THREE.WebGLRenderer({ antialias:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.05;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.LinearToneMapping;
+renderer.toneMappingExposure = 1.0;
 host.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x0c0f13);
-scene.fog = new THREE.Fog(0x0c0f13, 6, 22);
+scene.background = new THREE.Color(0xf8fafc);
 
 const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
 camera.position.set(2.6, 1.7, 4.2);
@@ -225,23 +224,28 @@ controls.target.set(0, 0.95, 0);
 controls.minDistance = 1.5; controls.maxDistance = 16;
 controls.maxPolarAngle = Math.PI*0.92;
 
-// lighting
-scene.add(new THREE.HemisphereLight(0x9fd4ff, 0x1a2028, 0.55));
-const key = new THREE.DirectionalLight(0xffffff, 2.1);
-key.position.set(4,7,3); key.castShadow = true;
-key.shadow.mapSize.set(2048,2048); key.shadow.bias = -0.0003;
+// Neutral three-point lighting, matched to the offline visualization balance.
+scene.add(new THREE.AmbientLight(0xffffff, 0.42));
+scene.add(new THREE.HemisphereLight(0xffffff, 0xdbe3ea, 0.55));
+const key = new THREE.DirectionalLight(0xffffff, 1.05);
+key.position.set(4,6,4); key.castShadow = true;
+key.shadow.mapSize.set(2048,2048); key.shadow.bias = -0.0001;
+key.shadow.normalBias = 0.015; key.shadow.radius = 4;
 key.shadow.camera.left=-4; key.shadow.camera.right=4; key.shadow.camera.top=4; key.shadow.camera.bottom=-4;
 scene.add(key);
-const rim = new THREE.DirectionalLight(0x2fb6c4, 0.9); rim.position.set(-5,3,-4); scene.add(rim);
+const fill = new THREE.DirectionalLight(0xffffff, 0.45);
+fill.position.set(-4,3,5); scene.add(fill);
+const rim = new THREE.DirectionalLight(0xffffff, 0.60);
+rim.position.set(1,5,-5); scene.add(rim);
 
 // ground
 const ground = new THREE.Mesh(
   new THREE.CircleGeometry(14, 64),
-  new THREE.MeshStandardMaterial({ color:0x11161d, roughness:0.95, metalness:0.0 })
+  new THREE.MeshStandardMaterial({ color:0xe7ecf0, roughness:1.0, metalness:0.0 })
 );
 ground.rotation.x = -Math.PI/2; ground.receiveShadow = true; scene.add(ground);
-const grid = new THREE.GridHelper(20, 40, 0x2a3540, 0x1a222b);
-grid.material.opacity = 0.5; grid.material.transparent = true; scene.add(grid);
+const grid = new THREE.GridHelper(20, 40, 0xaebac4, 0xd2d9df);
+grid.material.opacity = 0.42; grid.material.transparent = true; scene.add(grid);
 
 function resize(){
   const w = host.clientWidth, h = host.clientHeight;
@@ -257,7 +261,9 @@ new ResizeObserver(resize).observe(host); resize();
 const PARENT = [-1,0,0,0,1,2,3,4,5,6,7,8,9,9,9,12,13,14,16,17,18,19];
 
 // skin material — one continuous surface
-const skinMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.62, metalness:0.04 });
+const skinMat = new THREE.MeshStandardMaterial({
+  color:0x8fcbe8, roughness:0.78, metalness:0.0, flatShading:false
+});
 // per-joint body radius (world metres) — 比骨架飽滿，四肢/軀幹才有肉感
 const RJ = [0.140,0.090,0.090,0.130,0.066,0.066,0.135,0.052,0.052,0.145,0.046,0.046,
             0.055,0.090,0.090,0.100,0.078,0.078,0.058,0.058,0.046,0.046];
@@ -296,7 +302,10 @@ function poseFigure(joints){ // joints: Array(22) of [x,y,z]
 }
 
 /* --- 真 SMPL mesh（後端擬合回傳的 verts + faces；播放時只更新頂點 → 即時）--- */
-const smeshMat = new THREE.MeshStandardMaterial({ color:0xe4d9c8, roughness:0.72, metalness:0.03, side:THREE.DoubleSide });
+const smeshMat = new THREE.MeshStandardMaterial({
+  color:0x8fcbe8, roughness:0.78, metalness:0.0,
+  side:THREE.FrontSide, flatShading:false
+});
 const smeshGeo = new THREE.BufferGeometry();
 const smesh = new THREE.Mesh(smeshGeo, smeshMat);
 smesh.castShadow = true; smesh.visible = false; scene.add(smesh);
@@ -310,10 +319,18 @@ function setupMesh(c){                       // c: {V, faces:Uint32Array, verts:
   meshFrame(c, 0);
   smeshGeo.computeBoundingSphere();
 }
-function meshFrame(c, f){
-  const V=c.V, pos=smeshGeo.getAttribute('position');
-  pos.array.set(c.verts.subarray(f*V*3, (f+1)*V*3)); pos.needsUpdate=true;
+function meshFrame(c, f, next=f, alpha=0){
+  const V3=c.V*3, pos=smeshGeo.getAttribute('position');
+  const dst=pos.array, start0=f*V3, start1=next*V3;
+  if(alpha<=0 || f===next){
+    dst.set(c.verts.subarray(start0, start0+V3));
+  }else{
+    const beta=1-alpha;
+    for(let i=0;i<V3;i++) dst[i]=beta*c.verts[start0+i]+alpha*c.verts[start1+i];
+  }
+  pos.needsUpdate=true;
   smeshGeo.computeVertexNormals();
+  smeshGeo.normalizeNormals();
 }
 
 /* ============================================================
@@ -493,9 +510,14 @@ function tick(){
   const dt=clock.getDelta();
   if(clip && playing){
     acc+=dt*speed*fps;
-    if(acc>=1){ const L=clipLen(clip); fIdx=(fIdx+Math.floor(acc))%L; acc%=1; setFrame(fIdx);
+    if(acc>=1){ const L=clipLen(clip); fIdx=(fIdx+Math.floor(acc))%L; acc%=1;
+      if(clip.kind!=='mesh') setFrame(fIdx);
       document.getElementById('scrub').value=fIdx;
       document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; }
+    if(clip.kind==='mesh'){
+      const L=clipLen(clip), next=fIdx+1<L ? fIdx+1 : fIdx;
+      meshFrame(clip, fIdx, next, acc);
+    }
   }
   controls.update(); renderer.render(scene,camera);
 }
@@ -604,7 +626,7 @@ function flash(msg){ loadTxt.textContent=msg; loadEl.classList.add('show'); setT
 // playback controls
 const playBtn=document.getElementById('playBtn'), scrub=document.getElementById('scrub');
 playBtn.onclick=()=>{ playing=!playing; playBtn.textContent=playing?'⏸':'▶'; };
-scrub.oninput=()=>{ if(!clip)return; playing=false; playBtn.textContent='▶'; fIdx=+scrub.value; setFrame(fIdx);
+scrub.oninput=()=>{ if(!clip)return; playing=false; playBtn.textContent='▶'; fIdx=+scrub.value; acc=0; setFrame(fIdx);
   document.getElementById('tlabel').textContent=`${(fIdx/fps).toFixed(1)}s`; };
 document.querySelectorAll('.spd button').forEach(b=>b.onclick=()=>{ speed=+b.dataset.s;
   document.querySelectorAll('.spd button').forEach(x=>x.classList.toggle('act',x===b)); });
