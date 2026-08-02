@@ -1,7 +1,7 @@
 # VQ-MUSE training configuration.
-# Canonical variant: cumulative coarse-to-fine HRVQ latent composition.
+# Ablation/compatibility variant: independent raw codebook embeddings per scale.
 exp:
-  stage_dir: 'VA_motion'
+  stage_dir: 'VA_motion_raw'
   root_ckpt_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir'
   root_log_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/log'
   device: 'cuda:0'
@@ -45,7 +45,7 @@ model:
   use_vq_delta: true
   delta_beta: 0.15
   delta_temp: 0.15
-  delta_latent_mode: 'composed'
+  delta_latent_mode: 'raw'
 
 training:
   batch_size: 64

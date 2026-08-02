@@ -152,7 +152,7 @@
       <label>Delta residual <b id="v_db">0.30</b><input type="range" id="p_db" min="0" max="1" step="0.05" value="0.3"></label>
       <label>Source in-paint <b id="v_sk">0.00</b><input type="range" id="p_sk" min="0" max="0.9" step="0.05" value="0"></label>
       <label>Top-k thres <b id="v_tk">0.95</b><input type="range" id="p_tk" min="0.5" max="1" step="0.05" value="0.95"></label>
-      <label>Gen length <b id="v_ln">196f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="196"></label>
+      <label>Output length <b id="v_ln">196f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="196"></label>
       <label class="chk"><input type="checkbox" id="p_gum" checked> Gumbel sampling</label>
     </div>
   </div>
@@ -458,7 +458,7 @@ async function requestEdit(node, text){
   const p=readParams('edit');
   if(backendOk && node.backendId){
     const r=await fetch(API+'/edit',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({source_id:node.backendId, text, params:p})});
+      body:JSON.stringify({source_id:node.backendId, text, length:p.length, params:p})});
     if(!r.ok) throw new Error('edit '+r.status);
     return await parseClip(r);
   }

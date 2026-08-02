@@ -984,8 +984,14 @@ class VAMotion(nn.Module):
             source_present, same_target_ids, same_target_mask, same_src_text, same_src_flag
         )
 
-        #Info_NCE loss computation
-        loss_mt = self.InfoNCE_text(target_tokens, text_tokens_for_loss, target_mask, text_mask, temperature=0.15)
+        # Skip the contrastive branch entirely for the no-InfoNCE ablation.
+        if float(getattr(self.cfg.loss, "weight_motion_text_InfoNCE", 0.0)) > 0.0:
+            loss_mt = self.InfoNCE_text(
+                target_tokens, text_tokens_for_loss, target_mask, text_mask,
+                temperature=0.15,
+            )
+        else:
+            loss_mt = ce_loss.new_zeros(())
 
         return ce_loss, loss_mt.mean(), delta_loss, latent_loss, rank_loss, null_gain_loss, null_gain_gap, same_loss, same_gap, acc
     
@@ -1132,9 +1138,30 @@ class VAMotion(nn.Module):
         # 純推論(不需重訓)：BERT 式訓練本就會「給定可見 token 補齊其餘」，鎖住的 token 全程當可見脈絡。
         keep_mask = torch.zeros_like(ids, dtype=torch.bool)
         if source_keep_ratio and source_keep_ratio > 0:
+            # In-paint on the target timeline. Source and edited outputs may
+            # have different durations, so raw source IDs cannot be copied by
+            # position without first applying the same temporal alignment used
+            # by the ControlNet source canvas.
+            aligned_source_ids = []
+            start = 0
+            for scale, ps in zip(self.scales, self.patch_sizes):
+                tgt_len = (m_lens // scale).long().clamp(min=1, max=ps)
+                src_len = (source_m_lens // scale).long().clamp(min=1, max=ps)
+                t = torch.arange(ps, device=device).float().unsqueeze(0)
+                idx = torch.round(
+                    t * (src_len - 1).float().unsqueeze(1)
+                    / (tgt_len - 1).clamp(min=1).float().unsqueeze(1)
+                ).long()
+                idx = torch.minimum(idx, (src_len - 1).unsqueeze(1))
+                aligned_source_ids.append(
+                    torch.gather(source_ids[:, start:start + ps], 1, idx)
+                )
+                start += ps
+            aligned_source_ids = torch.cat(aligned_source_ids, dim=1)
+
             r = torch.rand_like(ids, dtype=torch.float)
             keep_mask = (r < float(source_keep_ratio)) & non_padding_mask & has_source
-            ids = torch.where(keep_mask, source_ids, ids)
+            ids = torch.where(keep_mask, aligned_source_ids, ids)
             scores = torch.where(keep_mask, torch.full_like(scores, 1e4), scores)
 
         for timestep in torch.linspace(0, 1, timesteps, device=device):

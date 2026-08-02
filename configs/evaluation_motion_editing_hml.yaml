@@ -19,7 +19,7 @@ num_workers: 0
 # Sampling params
 time_steps: [10]
 cond_scales: [2]       # legacy fallback if task-specific scales are absent
-gen_cond_scales: [4]   # matches training Gen Eval
+gen_cond_scales: [4]   # fixed generation guidance setting
 edit_cond_scales: [1.75]  # fixed MotionEdit evaluation setting
 source_cond_scale: 0.9 # fixed source guidance setting
 delta_beta: 0.4    # layer-wise VQ-latent delta residual strength

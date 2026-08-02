@@ -1,7 +1,7 @@
-# VQ-MUSE training configuration.
-# Canonical variant: cumulative coarse-to-fine HRVQ latent composition.
+# VQ-MUSE ablation: disable the complete VQ-latent delta branch while
+# retaining the same data curriculum, backbone, InfoNCE, and text-gain loss.
 exp:
-  stage_dir: 'VA_motion'
+  stage_dir: 'VA_motion_ablation_no_delta'
   root_ckpt_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir'
   root_log_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/log'
   device: 'cuda:0'
@@ -11,8 +11,6 @@ exp:
 debug:
   open: false
 
-# Frozen RVQ-VAE. Its paper-defining code_dim=512, nb_code=512, and
-# scales=[8, 4, 2, 1] remain single-sourced in residual_vqvae_hml.yaml.
 vq_cfg_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project'
 vq_name: 'residual_vqvae_hml.yaml'
 vq_ckpt: 'net_best_fid.tar'
@@ -42,8 +40,8 @@ model:
   use_abs_pe: true
   use_toa_pe: true
   use_lvl_pe: false
-  use_vq_delta: true
-  delta_beta: 0.15
+  use_vq_delta: false
+  delta_beta: 0.0
   delta_temp: 0.15
   delta_latent_mode: 'composed'
 
@@ -58,8 +56,6 @@ training:
   gumbel_sample: true
   pert_prob: 0.1
 
-  # Stage-1 defaults are repeated here so direct model construction and
-  # curriculum training begin from the same paper-defined state.
   edit_sample_ratio: 0.20
   m_drop: 0.10
   source_cfg_drop_prob: 0.20
@@ -80,10 +76,10 @@ training:
         m_drop: 0.10
         source_cfg_drop_prob: 0.20
         t_drop: 0.10
-        delta_beta: 0.15
-        weight_delta: 0.15
-        weight_latent: 0.01
-        weight_rank: 0.01
+        delta_beta: 0.0
+        weight_delta: 0.0
+        weight_latent: 0.0
+        weight_rank: 0.0
         weight_null_gain: 0.0
 
       - name: 'edit_grounding'
@@ -98,22 +94,20 @@ training:
         m_drop: 0.10
         source_cfg_drop_prob: 0.10
         t_drop: 0.10
-        delta_beta: 0.30
-        weight_delta: 0.50
-        weight_latent: 0.05
-        weight_rank: 0.05
+        delta_beta: 0.0
+        weight_delta: 0.0
+        weight_latent: 0.0
+        weight_rank: 0.0
         weight_null_gain: 0.30
 
-# Eq. 3.8: CE + InfoNCE + delta + latent consistency + rank + text gain.
 loss:
   weight_transformer_loss: 1.0
   weight_motion_text_InfoNCE: 0.20
-  weight_delta: 0.15
-  weight_latent: 0.01
-  weight_rank: 0.01
+  weight_delta: 0.0
+  weight_latent: 0.0
+  weight_rank: 0.0
   weight_null_gain: 0.0  # Stage-1 default; Stage 2 overrides this to 0.30.
 
-  # Active implementation details for the paper losses.
   delta_intermediate_weight: 0.30
   delta_rank_margin: 0.20
   null_gain_margin: 0.05

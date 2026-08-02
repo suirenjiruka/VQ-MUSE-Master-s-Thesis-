@@ -57,13 +57,13 @@ def load_vq_model(trans_cfg, device):
     return vq_model.to(device).eval(), vq_cfg
 
 
-def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False):
+def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False, stage_dir='VA_motion'):
     # Load current motion editing transformer; no video/joint condition is used
     trans_cfg.vq = vq_cfg.quantizer
     trans_cfg.vq.nb_code = vq_cfg.quantizer.nb_code
     trans = VAMotion(cfg=trans_cfg, device=device, full_length=trans_cfg.data.max_motion_length // trans_cfg.data.unit_length)
 
-    model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'model')
+    model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, stage_dir, 'model')
     ckpt_path = ckpt_name if os.path.isabs(ckpt_name) else pjoin(model_dir, ckpt_name)
     trans_ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = trans_ckpt['training_model']
@@ -282,6 +282,8 @@ if __name__ == '__main__':
                         help='Override eval_cfg.num_workers')
     parser.add_argument('--motionfix_start_id', type=int, default=None,
                         help='Override eval_cfg.motionfix_start_id')
+    parser.add_argument('--repeat_time', type=int, default=None,
+                        help='Override eval_cfg.repeat_time')
     parser.add_argument('--eval_generation', action='store_true',
                         help='Evaluate generation samples with HumanML3D text-motion metrics')
     parser.add_argument('--eval_editing', action='store_true',
@@ -290,6 +292,7 @@ if __name__ == '__main__':
 
     trans_cfg = load_config(args.trans_cfg)
     eval_cfg = load_config(args.eval_cfg)
+    stage_dir = getattr(eval_cfg, 'stage_dir', 'VA_motion')
     delta_beta = (
         args.delta_beta
         if args.delta_beta is not None
@@ -321,7 +324,10 @@ if __name__ == '__main__':
         use_ema = True
     if args.no_ema:
         use_ema = False
-    trans = load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=use_ema)
+    trans = load_trans_model(
+        trans_cfg, vq_cfg, ckpt_name, device,
+        use_ema=use_ema, stage_dir=stage_dir,
+    )
     if hasattr(trans, "set_vq_quantizer") and hasattr(vq_model, "quantizer"):
         trans.set_vq_quantizer(vq_model.quantizer)
     elif hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
@@ -347,15 +353,19 @@ if __name__ == '__main__':
     batch_size = args.batch_size or getattr(eval_cfg, 'batch_size', trans_cfg.training.batch_size)
     num_workers = args.num_workers if args.num_workers is not None else getattr(eval_cfg, 'num_workers', 0)
     motionfix_start_id = args.motionfix_start_id if args.motionfix_start_id is not None else getattr(eval_cfg, 'motionfix_start_id', 400000)
+    repeat_time = args.repeat_time if args.repeat_time is not None else int(eval_cfg.repeat_time)
+    if repeat_time <= 0:
+        parser.error('--repeat_time must be positive')
 
     gen_loader = build_generation_loader(trans_cfg, hml3d_opt, mean, std, split, batch_size, num_workers, motionfix_start_id) if eval_generation else None
     edit_loader = build_editing_loader(trans_cfg, hml3d_opt, mean, std, split, batch_size, num_workers, motionfix_start_id) if eval_editing else None
 
-    log_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'eval')
+    log_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, stage_dir, 'eval')
     os.makedirs(log_dir, exist_ok=True)
     ckpt_tag = ckpt_name.replace("\\", "/").replace("/", "_").replace(".tar", "")
     delta_tag = f'{delta_beta:g}'.replace('.', 'p')
-    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_tag}_db{delta_tag}.log'
+    task_tag = 'gen_edit' if eval_generation and eval_editing else ('gen' if eval_generation else 'edit')
+    log_name = f'{eval_cfg.ext}_{task_tag}_{split}_{ckpt_tag}_db{delta_tag}.log'
     out_path = pjoin(log_dir, log_name)
     f = open(out_path, 'w', encoding='utf-8')
     print(f'Logging to {out_path}')
@@ -378,7 +388,7 @@ if __name__ == '__main__':
             for ts in eval_cfg.time_steps:
                 gen_metrics_list, edit_metrics_list = [], []
 
-                for i in range(eval_cfg.repeat_time):
+                for i in range(repeat_time):
                     fixseed(base_seed + i)
                     header = f'Gen scale: {gen_cs}, Edit scale: {edit_cs}, source scale: {source_cond_scale}, delta beta: {delta_beta}, time step: {ts}, repeat: {i}'
                     print(header)

@@ -50,7 +50,8 @@ def copy_runtime_training_overrides(saved_cfg, runtime_cfg):
         if key in runtime_cfg.training:
             saved_cfg.training[key] = runtime_cfg.training[key]
     for key in (
-        "weight_delta", "weight_latent", "weight_rank", "weight_null_gain", "weight_same_src",
+        "weight_motion_text_InfoNCE", "weight_delta", "weight_latent", "weight_rank",
+        "weight_null_gain", "weight_same_src",
         "null_gain_margin", "null_gain_topk", "null_gain_temp", "eval_null_gain_metric",
     ):
         if key in runtime_cfg.loss:
@@ -147,12 +148,13 @@ if __name__ == '__main__':
     if args.stage != 'source':
         print("stage=text is disabled; keep source-branch stage only")
         args.stage = 'source'
-    stage_dirname = 'VA_motion'
+    stage_dirname = getattr(cfg.exp, "stage_dir", "VA_motion")
     cfg.exp.checkpoint_dir = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, stage_dirname)
 
     print("dataset: hml3d")
     print(f"gen_only: {args.gen_only}")
     print(f"max_epoch: {cfg.training.max_epoch}")
+    print(f"text-motion InfoNCE weight: {float(cfg.loss.weight_motion_text_InfoNCE):.3f}")
 
     if cfg.exp.is_continue:
         n_cfg = load_config(pjoin(cfg.exp.checkpoint_dir, os.path.basename(args.config)))

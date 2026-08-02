@@ -1136,7 +1136,10 @@ def _run(text, length, source_id, p):
             Ts = entry["len"]
             src_len = torch.tensor([Ts], device=device).long()
             source_m_lens = src_len // UNIT
-            m_len = src_len.clone()                       # edit keeps source length
+            # New clients choose the edited duration explicitly. A missing or
+            # non-positive length keeps the legacy source-duration behavior.
+            L = Ts if length is None or int(length) <= 0 else int(np.clip(length, 40, MAXL))
+            m_len = torch.tensor([L], device=device).long()
         else:
             source_code_idx, source_m_lens = None, None
             L = int(np.clip(length, 40, MAXL))
@@ -1255,7 +1258,7 @@ def edit():
     if request.method == "OPTIONS":
         return ("", 204)
     d = request.get_json(force=True)
-    mid, kind, arr = _run(d["text"], 0, d["source_id"], d["params"])
+    mid, kind, arr = _run(d["text"], int(d.get("length", 0)), d["source_id"], d["params"])
     return _pack(mid, kind, arr)
 
 
