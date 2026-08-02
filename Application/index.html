@@ -145,12 +145,12 @@
   <div id="paramWrap">
     <button id="paramBtn">⚙ 推論參數</button>
     <div id="params" class="hidden">
-      <label>Time steps <b id="v_ts">12</b><input type="range" id="p_ts" min="1" max="30" step="1" value="12"></label>
-      <label>Gen scale <b id="v_gs">3.0</b><input type="range" id="p_gs" min="0" max="8" step="0.5" value="3"></label>
-      <label>Edit scale <b id="v_es">2.0</b><input type="range" id="p_es" min="0" max="8" step="0.5" value="2"></label>
-      <label>Source scale <b id="v_ss">1.2</b><input type="range" id="p_ss" min="0" max="4" step="0.1" value="1.2"></label>
-      <label>Source in-paint <b id="v_sk">0.50</b><input type="range" id="p_sk" min="0" max="0.9" step="0.05" value="0.5"></label>
-      <label>Temperature <b id="v_tp">1.0</b><input type="range" id="p_tp" min="0.1" max="2" step="0.1" value="1"></label>
+      <label>Time steps <b id="v_ts">10</b><input type="range" id="p_ts" min="1" max="30" step="1" value="10"></label>
+      <label>Gen scale <b id="v_gs">4.0</b><input type="range" id="p_gs" min="0" max="8" step="0.5" value="4"></label>
+      <label>Edit scale <b id="v_es">1.75</b><input type="range" id="p_es" min="0" max="8" step="0.25" value="1.75"></label>
+      <label>Source scale <b id="v_ss">0.9</b><input type="range" id="p_ss" min="0" max="4" step="0.1" value="0.9"></label>
+      <label>Delta residual <b id="v_db">0.30</b><input type="range" id="p_db" min="0" max="1" step="0.05" value="0.3"></label>
+      <label>Source in-paint <b id="v_sk">0.00</b><input type="range" id="p_sk" min="0" max="0.9" step="0.05" value="0"></label>
       <label>Top-k thres <b id="v_tk">0.95</b><input type="range" id="p_tk" min="0.5" max="1" step="0.05" value="0.95"></label>
       <label>Gen length <b id="v_ln">196f</b><input type="range" id="p_ln" min="40" max="196" step="4" value="196"></label>
       <label class="chk"><input type="checkbox" id="p_gum" checked> Gumbel sampling</label>
@@ -312,7 +312,9 @@ smesh.castShadow = true; smesh.visible = false; scene.add(smesh);
 let _smeshV = 0;
 function setupMesh(c){                       // c: {V, faces:Uint32Array, verts:Float32Array, F}
   if(_smeshV !== c.V){
-    smeshGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(c.V*3), 3));
+    const position = new THREE.BufferAttribute(new Float32Array(c.V*3), 3);
+    position.setUsage(THREE.DynamicDrawUsage);
+    smeshGeo.setAttribute('position', position);
     _smeshV = c.V;
   }
   smeshGeo.setIndex(new THREE.BufferAttribute(c.faces, 1));   // 同一套 SMPL 拓撲，每次載入設一次
@@ -329,6 +331,8 @@ function meshFrame(c, f, next=f, alpha=0){
     for(let i=0;i<V3;i++) dst[i]=beta*c.verts[start0+i]+alpha*c.verts[start1+i];
   }
   pos.needsUpdate=true;
+  // Keep shading continuous with the interpolated vertices. Updating normals
+  // only at the 20 Hz source frames makes smooth geometry look stepped.
   smeshGeo.computeVertexNormals();
   smeshGeo.normalizeNormals();
 }
@@ -414,8 +418,8 @@ function readParams(mode){
   const g=id=>+document.getElementById(id).value;
   return { time_steps:g('p_ts'),
     cond_scale: mode==='gen'? g('p_gs') : g('p_es'),   // gen scale / edit scale
-    source_scale:g('p_ss'), source_keep_ratio:g('p_sk'),   // in-paint 比例(edit 時鎖住的 source token)
-    temperature:g('p_tp'), topk:g('p_tk'),
+    source_scale:g('p_ss'), delta_beta:g('p_db'),
+    source_keep_ratio:g('p_sk'), topk:g('p_tk'),   // in-paint 比例(edit 時鎖住的 source token)
     gumbel:document.getElementById('p_gum').checked, length:g('p_ln') };
 }
 
@@ -638,10 +642,10 @@ const bindP=(id,vid,fmt)=>{const el=document.getElementById(id),lab=document.get
   const upd=()=>lab.textContent=fmt(el.value); el.addEventListener('input',upd); upd();};
 bindP('p_ts','v_ts',v=>v);
 bindP('p_gs','v_gs',v=>(+v).toFixed(1));
-bindP('p_es','v_es',v=>(+v).toFixed(1));
+bindP('p_es','v_es',v=>(+v).toFixed(2));
 bindP('p_ss','v_ss',v=>(+v).toFixed(2));
+bindP('p_db','v_db',v=>(+v).toFixed(2));
 bindP('p_sk','v_sk',v=>(+v).toFixed(2));
-bindP('p_tp','v_tp',v=>(+v).toFixed(1));
 bindP('p_tk','v_tk',v=>(+v).toFixed(2));
 bindP('p_ln','v_ln',v=>v+'f');
 

@@ -61,6 +61,7 @@ model:
   delta_alpha: 0.0
   delta_beta: 0.3
   delta_temp: 0.15
+  delta_latent_mode: 'composed'  # corrected HRVQ residual composition for new training
   # fuse_mode: 'in_context'
 
 
@@ -131,6 +132,7 @@ loss:
   weight_delta: 0.5
   weight_latent: 0.15
   weight_rank: 0.08
+  delta_intermediate_weight: 0.3
   weight_null_gain: 0.0
   delta_rank_margin: 0.2
   null_gain_margin: 0.05

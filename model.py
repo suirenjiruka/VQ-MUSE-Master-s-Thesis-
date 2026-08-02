@@ -203,6 +203,12 @@ class VAMotion(nn.Module):
         self.delta_alpha = float(getattr(cfg.model, "delta_alpha", 0.0))
         self.delta_beta = float(getattr(cfg.model, "delta_beta", 0.3))
         self.delta_temp = float(getattr(cfg.model, "delta_temp", 0.15))
+        self.delta_latent_mode = str(getattr(cfg.model, "delta_latent_mode", "composed")).lower()
+        if self.delta_latent_mode not in {"raw", "composed"}:
+            raise ValueError(
+                f"Unsupported model.delta_latent_mode={self.delta_latent_mode!r}; "
+                "expected 'raw' or 'composed'."
+            )
         self.delta_code_proj = nn.Linear(self.motion_dim, self.latent_dim)
         self.delta_control_proj = nn.Linear(self.latent_dim * 4, self.latent_dim)
         self.delta_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
@@ -388,6 +394,15 @@ class VAMotion(nn.Module):
         if ids.shape[1] != expected_len:
             raise ValueError(f"Expected {expected_len} flattened RVQ ids, got {ids.shape[1]}")
 
+        if self.delta_latent_mode == "raw":
+            # Compatibility for checkpoints trained before the HRVQ composition
+            # correction (for example best_45_1.tar). Those weights consumed
+            # one independent codebook vector per flattened scale token.
+            raw = self.vq_code_embeddings(ids, valid_mask)
+            if return_final:
+                return raw, raw[:, -self.patch_sizes[-1]:]
+            return raw
+
         codebook = self.get_vq_codebook(ids.device, self.token_emb.weight.dtype)
         quantizer = object.__getattribute__(self, "_vq_quantizer_ref")
         if quantizer is None and abs(float(getattr(self.cfg.vq, "quant_resi", 0.0))) > 1e-6:
@@ -505,13 +520,13 @@ class VAMotion(nn.Module):
 
     def run_delta_branch(self, transformer_input, text_cross, source_cross, aligned_src_ids,
                          target_mask, padding_mask, delta_active, need_latent=True):
-        # extra edit path, silent for gen/null-text samples
+        # Depth-matched ControlNet path, silent for gen/null-text samples.
         if (not self.use_vq_delta) or (self.delta_alpha == 0.0 and self.delta_beta == 0.0 and not need_latent):
-            return None, None, None, None
+            return None, None, None, None, None
 
         active = delta_active.view(-1, 1, 1).bool()
         if active.sum() == 0:
-            return None, None, None, None
+            return None, None, None, None, None
 
         valid = target_mask.bool() & active.squeeze(-1)
         z_src, z_src_final = self.vq_latents(
@@ -522,16 +537,30 @@ class VAMotion(nn.Module):
         delta_control = self.delta_control_proj(delta_control)
 
         delta_residuals, delta_hiddens = self.delta_encoder(
-            transformer_input, delta_control, cond=text_cross, padding_mask=padding_mask, return_hiddens=True
+            transformer_input, delta_control, cond=text_cross,
+            padding_mask=padding_mask, return_hiddens=True
         )
-        delta_pred_all = self.delta_head(delta_hiddens[-1]) * active.float()
 
         pred_z = None
-        delta_pred = None
         latent_res_logits = None
+        delta_pred = None
+        intermediate_delta_pred = None
         if need_latent or self.delta_alpha != 0.0:
             full_t = self.patch_sizes[-1]
-            delta_pred = delta_pred_all[:, -full_t:]
+            final_valid = target_mask[:, -full_t:].bool().unsqueeze(-1)
+
+            delta_pred = self.delta_head(delta_hiddens[-1])[:, -full_t:]
+            delta_pred = (delta_pred * active.float()).masked_fill(~final_valid, 0.0)
+
+            # Shared-head deep supervision at the midpoint (block 4 for an
+            # eight-block encoder). This shapes depth-specific control features
+            # without adding a second transformer or eight independent heads.
+            mid_idx = max(0, len(delta_hiddens) // 2 - 1)
+            intermediate_delta_pred = self.delta_head(delta_hiddens[mid_idx])[:, -full_t:]
+            intermediate_delta_pred = (
+                intermediate_delta_pred * active.float()
+            ).masked_fill(~final_valid, 0.0)
+
             pred_z = z_src_final + delta_pred
             # Re-quantization is auxiliary and does not bias main token logits.
             if self.delta_alpha != 0.0:
@@ -539,7 +568,7 @@ class VAMotion(nn.Module):
                     "model.delta_alpha must remain 0; the VQ-latent CE is an "
                     "auxiliary loss and is not added to main token logits."
                 )
-        return delta_residuals, latent_res_logits, pred_z, delta_pred
+        return delta_residuals, latent_res_logits, pred_z, delta_pred, intermediate_delta_pred
 
     def apply_vq_delta_logits(self, token_logits, latent_res_logits):
         if latent_res_logits is None or self.delta_alpha == 0.0:
@@ -616,7 +645,7 @@ class VAMotion(nn.Module):
             source_cross = torch.where(sp, source_cross, text_cross)
             transformer_input = mm + source_cross
             control_residuals = self.control_encoder(transformer_input, asp, cond=text_cross, padding_mask=~tm)
-            delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
+            delta_residuals, latent_res_logits, _, _, _ = self.run_delta_branch(
                 transformer_input, text_cross, source_cross, asi, tm, ~tm, ae, need_latent=False
             )
             output = self.adaln_encoder(
@@ -650,7 +679,7 @@ class VAMotion(nn.Module):
 
     def vq_delta_losses(self, pred_z, delta_pred, target_ids, source_ids,
                         target_mask, predict_mask, active_edit,
-                        target_prequant=None):
+                        target_prequant=None, intermediate_delta_pred=None):
         zero = self.token_emb.weight.new_tensor(0.0)
         if pred_z is None or delta_pred is None:
             return zero, zero, zero
@@ -683,7 +712,23 @@ class VAMotion(nn.Module):
         final_valid = valid[:, -full_t:]
         weight = final_valid.float()
         delta_dist = F.smooth_l1_loss(delta_pred, gt_delta, reduction="none").mean(dim=-1)
-        delta_loss = (delta_dist * weight).sum() / weight.sum().clamp(min=1.0)
+        final_delta_loss = (delta_dist * weight).sum() / weight.sum().clamp(min=1.0)
+        if intermediate_delta_pred is None:
+            delta_loss = final_delta_loss
+        else:
+            intermediate_dist = F.smooth_l1_loss(
+                intermediate_delta_pred, gt_delta, reduction="none"
+            ).mean(dim=-1)
+            intermediate_loss = (
+                (intermediate_dist * weight).sum() / weight.sum().clamp(min=1.0)
+            )
+            intermediate_weight = min(max(float(getattr(
+                self.cfg.loss, "delta_intermediate_weight", 0.3
+            )), 0.0), 1.0)
+            delta_loss = (
+                intermediate_weight * intermediate_loss
+                + (1.0 - intermediate_weight) * final_delta_loss
+            )
 
         pred_n = F.normalize(pred_z, dim=-1)
         tgt_n = F.normalize(z_tgt.detach(), dim=-1)
@@ -881,7 +926,7 @@ class VAMotion(nn.Module):
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=~target_mask)
         # VQ delta path is only for edit samples with real source and real text
         active_edit = source_present & (~text_cfg_mask)
-        delta_residuals, latent_res_logits, pred_z, delta_pred = self.run_delta_branch(
+        delta_residuals, latent_res_logits, pred_z, delta_pred, intermediate_delta_pred = self.run_delta_branch(
             transformer_input, text_cross, source_cross, aligned_src_ids,
             target_mask, ~target_mask, active_edit
         )
@@ -905,7 +950,8 @@ class VAMotion(nn.Module):
         delta_loss, latent_loss, rank_loss = self.vq_delta_losses(
             pred_z, delta_pred, target_ids, aligned_src_ids,
             target_mask, predict_mask, active_edit,
-            target_prequant=target_prequant
+            target_prequant=target_prequant,
+            intermediate_delta_pred=intermediate_delta_pred
         )
         null_gain_loss = raw_logits.new_tensor(0.0)
         null_gain_gap = raw_logits.new_tensor(0.0)
@@ -1001,7 +1047,7 @@ class VAMotion(nn.Module):
         # source branch: branch A gate 0, branch B/C use aligned source
         control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=input_motion_padding_mask)
         active_edit = input_has_source & input_has_text
-        delta_residuals, latent_res_logits, _, _ = self.run_delta_branch(
+        delta_residuals, latent_res_logits, _, _, _ = self.run_delta_branch(
             transformer_input, text_cross, source_cross, aligned_src_ids,
             non_pad, input_motion_padding_mask, active_edit, need_latent=False
         )

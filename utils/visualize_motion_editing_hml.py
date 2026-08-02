@@ -4,6 +4,7 @@ if os.name != "nt":
 
 import argparse
 import copy
+import pickle
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -39,6 +40,19 @@ SMPL_KINEMATIC_CHAIN = [
     [12, 13, 16, 18, 20],
     [12, 14, 17, 19, 21],
 ]
+
+
+def load_trusted_local_checkpoint(path, device):
+    """Load project-owned checkpoints, including legacy NumPy metadata."""
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except pickle.UnpicklingError:
+        print(
+            f"Safe weights-only loading rejected legacy metadata in {path}; "
+            "retrying as a trusted local checkpoint.",
+            flush=True,
+        )
+        return torch.load(path, map_location=device, weights_only=False)
 
 
 def import_renderer():
@@ -113,7 +127,7 @@ def load_trans_model(cfg, vq_cfg, ckpt_name, device):
     cfg.vq = vq_cfg.quantizer
     cfg.vq.nb_code = vq_cfg.quantizer.nb_code
     ckpt_path = resolve_trans_ckpt_path(cfg, ckpt_name)
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ckpt = load_trusted_local_checkpoint(ckpt_path, device)
 
     # old checkpoints do not have the task token, keep visual results faithful to the ckpt
     if "task_embed.weight" not in ckpt["training_model"]:

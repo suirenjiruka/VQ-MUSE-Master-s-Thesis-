@@ -270,6 +270,10 @@ if __name__ == '__main__':
                         help='Use EMA weights from checkpoint when available')
     parser.add_argument('--no_ema', action='store_true',
                         help='Force raw training_model weights even if eval_cfg.use_ema is true')
+    parser.add_argument('--legacy_delta_latent', action='store_true',
+                        help='Use raw per-scale codebook latents for checkpoints trained before the HRVQ composition correction')
+    parser.add_argument('--delta_beta', type=float, default=None,
+                        help='Override the inference-time layer-wise delta residual strength')
     parser.add_argument('--split', type=str, default=None,
                         help='Override eval_cfg.split, e.g. val or test')
     parser.add_argument('--batch_size', type=int, default=None,
@@ -286,6 +290,18 @@ if __name__ == '__main__':
 
     trans_cfg = load_config(args.trans_cfg)
     eval_cfg = load_config(args.eval_cfg)
+    delta_beta = (
+        args.delta_beta
+        if args.delta_beta is not None
+        else float(getattr(eval_cfg, 'delta_beta', trans_cfg.model.delta_beta))
+    )
+    if not np.isfinite(delta_beta) or delta_beta < 0.0:
+        parser.error('--delta_beta must be a finite non-negative value')
+    trans_cfg.model.delta_beta = float(delta_beta)
+    print(f'Inference delta residual strength: {delta_beta:.3f}')
+    if args.legacy_delta_latent:
+        trans_cfg.model.delta_latent_mode = 'raw'
+        print('Legacy delta-latent compatibility: raw per-scale codebook embeddings')
 
     # yaml controls default task selection; CLI task flags are explicit overrides
     if args.eval_generation or args.eval_editing:
@@ -338,7 +354,8 @@ if __name__ == '__main__':
     log_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'eval')
     os.makedirs(log_dir, exist_ok=True)
     ckpt_tag = ckpt_name.replace("\\", "/").replace("/", "_").replace(".tar", "")
-    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_tag}.log'
+    delta_tag = f'{delta_beta:g}'.replace('.', 'p')
+    log_name = f'{eval_cfg.ext}_gen_edit_{split}_{ckpt_tag}_db{delta_tag}.log'
     out_path = pjoin(log_dir, log_name)
     f = open(out_path, 'w', encoding='utf-8')
     print(f'Logging to {out_path}')
@@ -363,7 +380,7 @@ if __name__ == '__main__':
 
                 for i in range(eval_cfg.repeat_time):
                     fixseed(base_seed + i)
-                    header = f'Gen scale: {gen_cs}, Edit scale: {edit_cs}, source scale: {source_cond_scale}, time step: {ts}, repeat: {i}'
+                    header = f'Gen scale: {gen_cs}, Edit scale: {edit_cs}, source scale: {source_cond_scale}, delta beta: {delta_beta}, time step: {ts}, repeat: {i}'
                     print(header)
                     print(header, file=f, flush=True)
 
@@ -389,7 +406,7 @@ if __name__ == '__main__':
                             print(format_editing(edit_metrics))
                             print(format_editing(edit_metrics), file=f, flush=True)
 
-                summary_head = f'=== Final Result  gen_cs={gen_cs}  edit_cs={edit_cs}  source_scale={source_cond_scale}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
+                summary_head = f'=== Final Result  gen_cs={gen_cs}  edit_cs={edit_cs}  source_scale={source_cond_scale}  delta_beta={delta_beta}  ts={ts}  split={split}  ckpt={ckpt_name} ==='
                 print(summary_head)
                 print(summary_head, file=f, flush=True)
 

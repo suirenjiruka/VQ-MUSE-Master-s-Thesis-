@@ -27,7 +27,7 @@ os.chdir(ROOT)  # relative paths in configs resolve from the project root
 from configs.load_config import load_config
 from utils.visualize_motion_editing_hml import (
     load_mean_std, load_vq_model, load_trans_model, denorm_motion, motion_to_joints,
-    resolve_trans_ckpt_path,
+    resolve_trans_ckpt_path, load_trusted_local_checkpoint,
 )
 
 TRANS_CFG = os.environ.get("TRANS_CFG", pjoin(ROOT, "configs", "train_vamotion_hml.yaml"))
@@ -36,9 +36,12 @@ PORT      = int(os.environ.get("PORT", "5000"))
 USE_EMA   = os.environ.get("USE_EMA", "1") != "0"   # eval 設定 use_ema:True；用 USE_EMA=0 可載原始權重對照
 
 
+LEGACY_DELTA_LATENT = os.environ.get("LEGACY_DELTA_LATENT", "0") == "1"
+
+
 def apply_ema(model, ckpt_path, device):
     """把 checkpoint 裡的 EMA 影子權重覆蓋到模型（對齊 eval 的 use_ema:True）。"""
-    ck = torch.load(ckpt_path, map_location=device, weights_only=True)
+    ck = load_trusted_local_checkpoint(ckpt_path, device)
     shadow = ck.get("ema", {}).get("shadow", {}) if isinstance(ck.get("ema"), dict) else {}
     if not shadow:
         print("[boot] ckpt 無 EMA shadow，沿用原始 training_model 權重", flush=True)
@@ -54,6 +57,9 @@ def apply_ema(model, ckpt_path, device):
 
 print(f"[boot] loading model … cfg={TRANS_CFG} ckpt={CKPT} use_ema={USE_EMA}", flush=True)
 cfg = load_config(TRANS_CFG)
+if LEGACY_DELTA_LATENT:
+    cfg.model.delta_latent_mode = "raw"
+    print("[boot] legacy delta latent mode: raw per-scale codebook embeddings", flush=True)
 device = torch.device(cfg.exp.device if (cfg.exp.device == "cpu" or torch.cuda.is_available()) else "cpu")
 mean, std = load_mean_std(cfg)
 vq_cfg = load_config(pjoin(cfg.vq_cfg_dir, "configs", cfg.vq_name))
@@ -62,6 +68,7 @@ trans = load_trans_model(cfg, vq_cfg, CKPT, device)          # also sets cfg.vq 
 if USE_EMA:
     apply_ema(trans, resolve_trans_ckpt_path(cfg, CKPT), device)
 trans.eval()
+DEFAULT_DELTA_BETA = float(getattr(trans, "delta_beta", 0.3))
 if hasattr(trans, "set_vq_codebook") and hasattr(vq_model, "quantizer") and hasattr(vq_model.quantizer, "codebook"):
     trans.set_vq_codebook(vq_model.quantizer.codebook)
 UNIT = cfg.data.unit_length
@@ -102,6 +109,8 @@ LBS_STRETCH = os.environ.get("LBS_STRETCH", "1") != "0" # ④ 沿骨軸伸縮(�
 SMOOTH_WIN  = int(os.environ.get("SMOOTH_WIN", "0"))    # 關節時間平滑半徑(減少抖動；0=關)
 TAUBIN_ITERS= int(os.environ.get("TAUBIN_ITERS", "2"))  # 網格 Taubin 平滑迭代(減少表面扭曲/重疊觀感；0=關)
 IK_SMOOTH_WIN = int(os.environ.get("IK_SMOOTH_WIN", "1"))
+IK_JITTER_FILTER = os.environ.get("IK_JITTER_FILTER", "1") != "0"
+MOTION_DIAGNOSTICS = os.environ.get("MOTION_DIAGNOSTICS", "1") != "0"
 POSE_REFINE_ITERS = max(0, int(os.environ.get("POSE_REFINE_ITERS", "4")))
 POSE_REFINE_BUDGET = max(
     0.0, float(os.environ.get("POSE_REFINE_BUDGET", "0.45"))
@@ -1011,6 +1020,53 @@ def smooth_joints_time(joints, win):
     return y.view(joints.shape[1], 3, L).permute(2, 0, 1).contiguous()
 
 
+def suppress_joint_jitter(joints):
+    """Remove frame-to-frame jitter without damping smooth motion trends.
+
+    The seven-point, second-order Savitzky-Golay kernel preserves constant
+    velocity and acceleration. Unlike a Gaussian moving average, it therefore
+    does not make deliberate motion slower or more conservative.
+    """
+    frame_count = joints.shape[0]
+    if frame_count < 7:
+        return joints
+    kernel = joints.new_tensor([-2.0, 3.0, 6.0, 7.0, 6.0, 3.0, -2.0]) / 21.0
+    signal = joints.permute(1, 2, 0).reshape(-1, 1, frame_count)
+    signal = torch.nn.functional.pad(signal, (3, 3), mode="reflect")
+    filtered = torch.nn.functional.conv1d(signal, kernel.view(1, 1, 7))
+    return filtered.view(joints.shape[1], 3, frame_count).permute(2, 0, 1).contiguous()
+
+
+def temporal_motion_stats(joints):
+    """Return scale-normalized root acceleration and local-pose jerk."""
+    if joints.shape[0] < 4:
+        return 0.0, 0.0
+    root = joints[:, 0]
+    local = joints - root[:, None]
+    body_scale = (
+        local.amax(dim=(0, 1)) - local.amin(dim=(0, 1))
+    ).norm().clamp_min(1e-6)
+    root_acc = root[2:] - 2.0 * root[1:-1] + root[:-2]
+    local_jerk = (
+        local[3:] - 3.0 * local[2:-1]
+        + 3.0 * local[1:-2] - local[:-3]
+    )
+    return (
+        float(root_acc.norm(dim=-1).mean().item() / body_scale.item()),
+        float(local_jerk.norm(dim=-1).mean().item() / body_scale.item()),
+    )
+
+
+def mesh_diagnostic_joints(vertices):
+    """Regress diagnostic joints from the rendered fixed-male mesh."""
+    if not LBS or not LBS.get("raw_model"):
+        return None
+    regressor = LBS["raw_model"]["J_regressor"]
+    if regressor.shape[1] != vertices.shape[1]:
+        return None
+    return torch.einsum("jv,fvc->fjc", regressor, vertices)[:, :22]
+
+
 def fit_vertices_like_visualize(joints, init_pose=None):
     """Fit raw joints in the same batch size used by the offline visualizer."""
     chunk_frames = max(1, int(getattr(VIS_CFG, "max_frames", 60)))
@@ -1087,12 +1143,15 @@ def _run(text, length, source_id, p):
             m_len = torch.tensor([L], device=device).long()
 
         has_src_t = torch.tensor([1 if has_source else 0], device=device).long()
+        delta_beta = float(p.get("delta_beta", DEFAULT_DELTA_BETA))
+        if not np.isfinite(delta_beta) or delta_beta < 0.0:
+            raise ValueError("delta_beta must be a finite non-negative value")
+        trans.delta_beta = delta_beta
         kwargs = dict(
             timesteps=int(p["time_steps"]),
             cond_scale=float(p["cond_scale"]),
             source_cond_scale=float(p.get("source_scale", 1.0)),
             source_m_lens=source_m_lens,
-            temperature=float(p["temperature"]),
             topk_filter_thres=float(p["topk"]),
             gsample=bool(p["gumbel"]),
         )
@@ -1113,6 +1172,8 @@ def _run(text, length, source_id, p):
         joints_t = raw_joints_t if MESH_MODE == "fit" else smooth_joints_time(
             raw_joints_t, SMOOTH_WIN
         )
+        if MESH_MODE == "own" and IK_JITTER_FILTER:
+            joints_t = suppress_joint_jitter(joints_t)
         if MESH_OK:
             if MESH_MODE == "lbs":
                 verts_t = lbs_vertices(joints_t)                                          # position-driven LBS(最快 + 真位移)
@@ -1126,6 +1187,25 @@ def _run(text, length, source_id, p):
                 verts_t, _ = fit_vertices_like_visualize(joints_t, init_pose=init_pose)
             else:
                 verts_t, _, _ = proxy_vertices(denorm, joints_t, SMPL_MODEL, VIS_CFG, device)
+            if MOTION_DIAGNOSTICS:
+                raw_root_acc, raw_pose_jerk = temporal_motion_stats(raw_joints_t)
+                filtered_root_acc, filtered_pose_jerk = temporal_motion_stats(joints_t)
+                mesh_joints = mesh_diagnostic_joints(verts_t)
+                if mesh_joints is not None:
+                    mesh_root_acc, mesh_pose_jerk = temporal_motion_stats(mesh_joints)
+                    jerk_amp = mesh_pose_jerk / max(filtered_pose_jerk, 1e-8)
+                    print(
+                        "[motion-temporal] "
+                        f"task={'edit' if has_source else 'gen'} "
+                        f"keep={keep_ratio:.2f} "
+                        f"delta_beta={delta_beta:.2f} "
+                        f"raw(root_acc/pose_jerk)={raw_root_acc:.5f}/{raw_pose_jerk:.5f} "
+                        "filtered="
+                        f"{filtered_root_acc:.5f}/{filtered_pose_jerk:.5f} "
+                        f"mesh={mesh_root_acc:.5f}/{mesh_pose_jerk:.5f} "
+                        f"mesh_jerk_amp={jerk_amp:.2f}x",
+                        flush=True,
+                    )
             return mid, "mesh", _ground(verts_t.detach().cpu().numpy())
         return mid, "joints", _ground(joints_t.detach().cpu().numpy())
 
@@ -1157,7 +1237,10 @@ def cors(resp):
 @app.route("/health")
 def health():
     return jsonify(ok=True, device=str(device), ckpt=CKPT, use_ema=USE_EMA,
-                   mesh=MESH_OK, mesh_mode=(MESH_MODE if MESH_OK else None), fps=FPS, cached=len(CACHE))
+                   mesh=MESH_OK, mesh_mode=(MESH_MODE if MESH_OK else None),
+                   delta_latent_mode=str(getattr(trans, "delta_latent_mode", "unknown")),
+                   delta_beta=float(getattr(trans, "delta_beta", DEFAULT_DELTA_BETA)),
+                   fps=FPS, cached=len(CACHE))
 
 @app.route("/generate", methods=["POST", "OPTIONS"])
 def generate():
