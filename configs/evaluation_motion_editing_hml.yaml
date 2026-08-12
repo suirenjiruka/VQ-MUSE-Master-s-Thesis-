@@ -1,9 +1,8 @@
 device: 'cuda:0'
 
-# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
-which_ckpt: '_100.tar'
+# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VQMotion/model/
+which_ckpt: 'best.tar'
 use_ema: True
-stage_dir: 'VA_motion'
 
 # Data split and task switches
 split: 'test'
@@ -18,12 +17,10 @@ num_workers: 0
 
 # Sampling params
 time_steps: [10]
-cond_scales: [2]       # legacy fallback if task-specific scales are absent
 gen_cond_scales: [4]   # fixed generation guidance setting
 edit_cond_scales: [1.75]  # fixed MotionEdit evaluation setting
 source_cond_scale: 0.9 # fixed source guidance setting
 delta_beta: 0.4    # layer-wise VQ-latent delta residual strength
-source_hint_ratio: 0.2
 temperature: 1
 topkr: 0.95
 gsample: True

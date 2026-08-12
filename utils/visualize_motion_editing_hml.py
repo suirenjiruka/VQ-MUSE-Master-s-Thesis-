@@ -96,7 +96,8 @@ def load_vq_model(cfg, vq_cfg, device):
 
 
 def resolve_trans_ckpt_path(cfg, ckpt_name):
-    model_dir = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, 'VA_motion', 'model')
+    stage_dir = getattr(cfg.exp, "stage_dir", "VQMotion")
+    model_dir = pjoin(cfg.exp.root_ckpt_dir, cfg.data.name, stage_dir, 'model')
     ckpt_name = str(ckpt_name)
     if os.path.isabs(ckpt_name) or ckpt_name.startswith(("/", "\\")):
         candidates = [ckpt_name]
@@ -122,7 +123,7 @@ def resolve_trans_ckpt_path(cfg, ckpt_name):
 
 
 def load_trans_model(cfg, vq_cfg, ckpt_name, device):
-    from model import VAMotion
+    from model import VQMotion
 
     cfg.vq = vq_cfg.quantizer
     cfg.vq.nb_code = vq_cfg.quantizer.nb_code
@@ -133,7 +134,7 @@ def load_trans_model(cfg, vq_cfg, ckpt_name, device):
     if "task_embed.weight" not in ckpt["training_model"]:
         cfg.model.use_task_token = False
 
-    trans = VAMotion(cfg=cfg, device=device, full_length=cfg.data.max_motion_length // cfg.data.unit_length)
+    trans = VQMotion(cfg=cfg, device=device, full_length=cfg.data.max_motion_length // cfg.data.unit_length)
     missing, unexpected = trans.load_state_dict(ckpt["training_model"], strict=False)
     old_prefixes = (
         "text_delta_encoder.",

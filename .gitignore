@@ -3,8 +3,11 @@
 
 # local outputs / checkpoints
 /_codex_backups/
+/_codex_backups*
+/branch_switch_backups/
 /checkpoint_dir/
 /visualize/
+/docs/
 /__pycache__/
 **/__pycache__/
 *.pyc
@@ -13,15 +16,31 @@
 *.tmp
 
 # datasets / local assets
-/glove/
+/HumanML3D/
+/datasets/
+/VQMotion_assets/
+/body_models/
+/TMR/
 /pr_vipe_models/
 /poem/
+/Application/*.txt
+/Master_formal_paper__*.pdf
+/.codex_*.py
+/audit_source_target.py
+/Application/bench_lbs.py
+/data_preprocess/blender.py
+/utils/diagnose_condition_logp.py
+/utils/search_motionfix_edit_texts.py
 *.gif
 *.mp4
 *.avi
 *.png
 *.jpg
 *.jpeg
+
+# README assets
+!/assets/
+!/assets/vqmotion_architecture.png
 
 # model weights / installers
 *.pt

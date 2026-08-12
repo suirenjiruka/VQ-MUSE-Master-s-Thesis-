@@ -1,7 +1,7 @@
-trans_cfg: './configs/train_vamotion_hml.yaml'
+trans_cfg: './configs/train_vqmotion_hml.yaml'
 visual_cfg: './utils/visual_config.yaml'
 
-# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VA_motion/model/
+# Checkpoint filename inside <root_ckpt_dir>/humanml3d/VQMotion/model/
 ckpt: 'best_45_1.tar'
 
 # Data selection

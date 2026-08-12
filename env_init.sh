@@ -1,20 +1,13 @@
 
-conda create -n VA_motion python==3.11
-conda activate VA_motion
-pip install -r requirements.txt
+#!/usr/bin/env bash
+set -euo pipefail
 
-#add conda lib into env_paramenter while conda env activation
-conda install -c conda-forge cudatoolkit=11.8 cudnn -y
-mkdir -p $CONDA_PREFIX/etc/conda/activate.d
-mkdir -p $CONDA_PREFIX/etc/conda/deactivate.d
+conda create -n vqmotion python=3.11 -y
+conda activate vqmotion
 
-#activation environmentt settup for tensorflow cudnn refernece
-echo 'export OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH' > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
-echo 'export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CONDA_PREFIX/lib/' >> $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
-echo 'export CUDNN_PATH=$CONDA_PREFIX/lib/' >> $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
-#close cudnn synbol link while deacttivation
-echo 'export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH' > $CONDA_PREFIX/etc/conda/deactivate.d/env_vars.sh
-echo 'unset OLD_LD_LIBRARY_PATH' >> $CONDA_PREFIX/etc/conda/deactivate.d/env_vars.sh
-echo 'unset CUDNN_PATH' >> $CONDA_PREFIX/etc/conda/deactivate.d/env_vars.sh
-
-#Run cuda check
+echo "The reference momask environment uses PyTorch 2.4.1 with CUDA 12.1."
+echo "Install PyTorch first (change the wheel only when the target CUDA differs):"
+echo "  pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121"
+echo "Then install the project dependencies:"
+echo "  pip install -r requirements.txt"
+echo "TensorFlow is not required by VQMotion."

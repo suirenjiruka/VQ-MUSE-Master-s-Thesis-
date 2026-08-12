@@ -122,7 +122,7 @@ class OutputProcess_Bert(nn.Module):
         output = output.transpose(1, 2)  # [B, L, code_idx] -> [B, code_idx, L]
         return output
     
-class VAMotion(nn.Module):
+class VQMotion(nn.Module):
     def __init__(self, cfg, device = None, full_length=80):  # max token len
         super().__init__()
         self.scales = cfg.vq.scales  # multi-scale setup
@@ -195,6 +195,7 @@ class VAMotion(nn.Module):
         self.adaln_encoder = AdaLN_Encoder(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
                             ff_size=cfg.model.ff_size, n_layers=cfg.model.n_layers, dropout=cfg.model.dropout)
         # source control branch: source canvas residuals for edit samples
+        self.use_source_control = bool(getattr(cfg.model, "use_source_control", True))
         self.control_encoder = AdaLN_ControlBranch(model_dim=self.latent_dim, n_heads=cfg.model.n_heads, cond_dim=self.latent_dim,
                             ff_size=cfg.model.ff_size, n_layers=cfg.model.n_layers, dropout=cfg.model.dropout)
 
@@ -243,9 +244,21 @@ class VAMotion(nn.Module):
         nn.init.zeros_(self.text_adaptor.residual_block[-1].bias)
         # source branch keeps normal inner init; zero only the output boundary
         self.control_encoder.init_zero_layers()
+        if not self.use_source_control:
+            for param in self.control_encoder.parameters():
+                param.requires_grad_(False)
         self.delta_encoder.init_zero_layers()
         nn.init.zeros_(self.delta_head[-1].weight)
         nn.init.zeros_(self.delta_head[-1].bias)
+        if not self.use_vq_delta:
+            for module in (
+                self.delta_code_proj,
+                self.delta_control_proj,
+                self.delta_encoder,
+                self.delta_head,
+            ):
+                for param in module.parameters():
+                    param.requires_grad_(False)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         d = torch.cat([torch.full((ps,), i) for i, ps in enumerate(self.patch_sizes)]) #[1 * 10..., 2 * 20..., 3 * 40..., 4 * 80...]
         self.register_buffer('lvl_1L', d.contiguous())   # scale ids
@@ -350,6 +363,15 @@ class VAMotion(nn.Module):
         drop_mask = torch.rand_like(source_mask, dtype=torch.float, device=source_ids.device) < self.source_token_drop_prob
         drop_mask = drop_mask & source_mask.bool() & has_source.view(-1, 1).bool()
         return torch.where(drop_mask, self.mask_id, source_ids)
+
+    def run_source_control(self, transformer_input, aligned_source, text_cross, padding_mask):
+        """Return depth-matched source residuals, or disable the branch cleanly."""
+        if not self.use_source_control:
+            return None
+        return self.control_encoder(
+            transformer_input, aligned_source, cond=text_cross,
+            padding_mask=padding_mask,
+        )
 
     def set_vq_codebook(self, codebook):
         # Compatibility fallback for callers that only expose the code table.
@@ -644,7 +666,9 @@ class VAMotion(nn.Module):
             source_cross = self.source_cross(text_cross, st, sm)
             source_cross = torch.where(sp, source_cross, text_cross)
             transformer_input = mm + source_cross
-            control_residuals = self.control_encoder(transformer_input, asp, cond=text_cross, padding_mask=~tm)
+            control_residuals = self.run_source_control(
+                transformer_input, asp, text_cross, padding_mask=~tm
+            )
             delta_residuals, latent_res_logits, _, _, _ = self.run_delta_branch(
                 transformer_input, text_cross, source_cross, asi, tm, ~tm, ae, need_latent=False
             )
@@ -923,7 +947,9 @@ class VAMotion(nn.Module):
         transformer_input = masked_motion_tokens + source_cross
 
         # source control residuals; gated off for generation samples
-        control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=~target_mask)
+        control_residuals = self.run_source_control(
+            transformer_input, aligned_src, text_cross, padding_mask=~target_mask
+        )
         # VQ delta path is only for edit samples with real source and real text
         active_edit = source_present & (~text_cfg_mask)
         delta_residuals, latent_res_logits, pred_z, delta_pred, intermediate_delta_pred = self.run_delta_branch(
@@ -964,8 +990,9 @@ class VAMotion(nn.Module):
                 null_source_cross = self.source_cross(null_text_cross, source_tokens, source_mask)
                 null_source_cross = torch.where(source_present, null_source_cross, null_text_cross)
                 null_transformer_input = masked_motion_tokens + null_source_cross
-                null_control_residuals = self.control_encoder(
-                    null_transformer_input, aligned_src, cond=null_text_cross, padding_mask=~target_mask
+                null_control_residuals = self.run_source_control(
+                    null_transformer_input, aligned_src, null_text_cross,
+                    padding_mask=~target_mask,
                 )
                 null_output = self.adaln_encoder(
                     x=null_transformer_input,
@@ -1051,7 +1078,10 @@ class VAMotion(nn.Module):
         transformer_input = input_motion_embs + source_cross
 
         # source branch: branch A gate 0, branch B/C use aligned source
-        control_residuals = self.control_encoder(transformer_input, aligned_src, cond=text_cross, padding_mask=input_motion_padding_mask)
+        control_residuals = self.run_source_control(
+            transformer_input, aligned_src, text_cross,
+            padding_mask=input_motion_padding_mask,
+        )
         active_edit = input_has_source & input_has_text
         delta_residuals, latent_res_logits, _, _, _ = self.run_delta_branch(
             transformer_input, text_cross, source_cross, aligned_src_ids,

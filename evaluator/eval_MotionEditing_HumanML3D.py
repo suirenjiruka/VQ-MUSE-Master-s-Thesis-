@@ -10,7 +10,7 @@ from os.path import join as pjoin
 from configs.load_config import load_config
 from SnapMogen_model.vq.rvq_model import HRVQVAE
 from SnapMogen_model.evaluator.hml.t2m_eval_wrapper import EvaluatorModelWrapper
-from model import VAMotion
+from model import VQMotion
 from utils.get_opt import get_opt
 from utils.fixseeds import fixseed
 from utils.word_vectorizer import WordVectorizer
@@ -57,11 +57,11 @@ def load_vq_model(trans_cfg, device):
     return vq_model.to(device).eval(), vq_cfg
 
 
-def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False, stage_dir='VA_motion'):
+def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False, stage_dir='VQMotion'):
     # Load current motion editing transformer; no video/joint condition is used
     trans_cfg.vq = vq_cfg.quantizer
     trans_cfg.vq.nb_code = vq_cfg.quantizer.nb_code
-    trans = VAMotion(cfg=trans_cfg, device=device, full_length=trans_cfg.data.max_motion_length // trans_cfg.data.unit_length)
+    trans = VQMotion(cfg=trans_cfg, device=device, full_length=trans_cfg.data.max_motion_length // trans_cfg.data.unit_length)
 
     model_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, stage_dir, 'model')
     ckpt_path = ckpt_name if os.path.isabs(ckpt_name) else pjoin(model_dir, ckpt_name)
@@ -85,7 +85,7 @@ def load_trans_model(trans_cfg, vq_cfg, ckpt_name, device, use_ema=False, stage_
         print(f"missing keys from ckpt: {missing[:5]}")
     if unexpected:
         print(f"unexpected keys from ckpt: {unexpected[:5]}")
-    print(f'VAMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")}, use_ema={use_ema})')
+    print(f'VQMotion loaded: {ckpt_name} (epoch {trans_ckpt.get("epoch", "?")}, use_ema={use_ema})')
     return trans.to(device).eval()
 
 
@@ -110,7 +110,8 @@ def is_editing_id(name, motionfix_start_id):
 def build_task_split(trans_cfg, hml3d_opt, split, task_type, motionfix_start_id):
     # Filter mixed split once so each evaluator only reads valid files for its task
     src_split = pjoin(hml3d_opt.data_root, f"{split}.txt")
-    out_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, 'VA_motion', 'eval', 'splits')
+    stage_dir = getattr(trans_cfg.exp, 'stage_dir', 'VQMotion')
+    out_dir = pjoin(trans_cfg.exp.root_ckpt_dir, trans_cfg.data.name, stage_dir, 'eval', 'splits')
     os.makedirs(out_dir, exist_ok=True)
     out_split = pjoin(out_dir, f"{split}_{task_type}.txt")
 
@@ -260,18 +261,18 @@ def write_summary(title, metrics_list, keys, file_obj):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--trans_cfg', type=str, default='./configs/train_vamotion_hml.yaml',
-                        help='VAMotion motion editing training config')
+    parser.add_argument('--trans_cfg', type=str, default='./configs/train_vqmotion_hml.yaml',
+                        help='VQMotion motion editing training config')
     parser.add_argument('--eval_cfg', type=str, default='./configs/evaluation_motion_editing_hml.yaml',
                         help='Eval config: time_steps, cond_scales, repeat_time, sampling params')
     parser.add_argument('--ckpt', type=str, default=None,
                         help='Override checkpoint filename, default follows eval_cfg.which_ckpt')
+    parser.add_argument('--stage_dir', type=str, default=None,
+                        help='Override trans_cfg.exp.stage_dir for checkpoint lookup')
     parser.add_argument('--use_ema', action='store_true',
                         help='Use EMA weights from checkpoint when available')
     parser.add_argument('--no_ema', action='store_true',
                         help='Force raw training_model weights even if eval_cfg.use_ema is true')
-    parser.add_argument('--legacy_delta_latent', action='store_true',
-                        help='Use raw per-scale codebook latents for checkpoints trained before the HRVQ composition correction')
     parser.add_argument('--delta_beta', type=float, default=None,
                         help='Override the inference-time layer-wise delta residual strength')
     parser.add_argument('--split', type=str, default=None,
@@ -292,7 +293,7 @@ if __name__ == '__main__':
 
     trans_cfg = load_config(args.trans_cfg)
     eval_cfg = load_config(args.eval_cfg)
-    stage_dir = getattr(eval_cfg, 'stage_dir', 'VA_motion')
+    stage_dir = args.stage_dir or getattr(trans_cfg.exp, 'stage_dir', 'VQMotion')
     delta_beta = (
         args.delta_beta
         if args.delta_beta is not None
@@ -302,10 +303,6 @@ if __name__ == '__main__':
         parser.error('--delta_beta must be a finite non-negative value')
     trans_cfg.model.delta_beta = float(delta_beta)
     print(f'Inference delta residual strength: {delta_beta:.3f}')
-    if args.legacy_delta_latent:
-        trans_cfg.model.delta_latent_mode = 'raw'
-        print('Legacy delta-latent compatibility: raw per-scale codebook embeddings')
-
     # yaml controls default task selection; CLI task flags are explicit overrides
     if args.eval_generation or args.eval_editing:
         eval_generation, eval_editing = args.eval_generation, args.eval_editing

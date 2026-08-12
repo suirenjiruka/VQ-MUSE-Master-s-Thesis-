@@ -1,4 +1,10 @@
+import os
+
 import torch
+
+# VQMotion uses the PyTorch implementation of T5 exclusively. Prevent
+# Transformers from importing an installed legacy TensorFlow backend.
+os.environ.setdefault("USE_TF", "0")
 from transformers import AutoTokenizer, T5EncoderModel
 
 

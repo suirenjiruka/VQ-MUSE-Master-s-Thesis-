@@ -1,0 +1,130 @@
+# VQMotion ablation: composed HRVQ delta latent without text-motion InfoNCE.
+exp:
+  stage_dir: 'VQMotion_no_text_infonce'
+  root_ckpt_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir'
+  root_log_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project/checkpoint_dir/log'
+  device: 'cuda:0'
+  is_continue: false
+  seed: 10306
+
+debug:
+  open: false
+
+# Frozen RVQ-VAE. Its paper-defining code_dim=512, nb_code=512, and
+# scales=[8, 4, 2, 1] remain single-sourced in residual_vqvae_hml.yaml.
+vq_cfg_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/master_project'
+vq_name: 'residual_vqvae_hml.yaml'
+vq_ckpt: 'net_best_fid.tar'
+
+data:
+  name: 'humanml3d'
+  unit_length: 4
+  root_dir: '/home/imlab/HumanML3D/repo'
+  feat_dir: '/home/imlab/HumanML3D/repo/HumanML3D/new_joint_vecs'
+  motionfix_start_id: 400000
+  joint_num: 22
+  dim_pose: 263
+  fps: 20
+  max_motion_length: 196
+  max_text_length: 20
+
+text_embedder:
+  dim_embed: 1024
+  version: 'google/flan-t5-large'
+
+model:
+  latent_dim: 384
+  ff_size: 1024
+  n_layers: 8
+  n_heads: 8
+  dropout: 0.1
+  use_abs_pe: true
+  use_toa_pe: true
+  use_lvl_pe: false
+  use_source_control: true
+  use_vq_delta: true
+  delta_beta: 0.15
+  delta_temp: 0.15
+  delta_latent_mode: 'composed'
+
+training:
+  batch_size: 64
+  max_epoch: 130
+  lr: 1.5e-4
+  weight_decay: 0.01
+  warm_up_iter: 2000
+  log_every: 10
+  ema_decay: 0.999
+  gumbel_sample: true
+  pert_prob: 0.1
+
+  edit_sample_ratio: 0.20
+  m_drop: 0.10
+  source_cfg_drop_prob: 0.20
+  t_drop: 0.10
+  mask_lo: 0.10
+  mask_hi: 0.50
+  mask_schedule: 'uniform'
+
+  curriculum:
+    enabled: true
+    stages:
+      - name: 'soft_alignment'
+        end_epoch: 30
+        edit_sample_ratio: 0.20
+        mask_lo: 0.10
+        mask_hi: 0.50
+        mask_schedule: 'uniform'
+        m_drop: 0.10
+        source_cfg_drop_prob: 0.20
+        t_drop: 0.10
+        delta_beta: 0.15
+        weight_delta: 0.15
+        weight_latent: 0.01
+        weight_rank: 0.01
+        weight_null_gain: 0.0
+
+      - name: 'edit_grounding'
+        end_epoch: 130
+        reset_optimizer: true
+        lr: 1.5e-4
+        warm_up_iter: 1000
+        edit_sample_ratio: 0.35
+        mask_lo: 0.30
+        mask_hi: 1.00
+        mask_schedule: 'cosine'
+        m_drop: 0.10
+        source_cfg_drop_prob: 0.10
+        t_drop: 0.10
+        delta_beta: 0.30
+        weight_delta: 0.50
+        weight_latent: 0.05
+        weight_rank: 0.05
+        weight_null_gain: 0.30
+
+loss:
+  weight_transformer_loss: 1.0
+  weight_motion_text_InfoNCE: 0.0
+  weight_delta: 0.15
+  weight_latent: 0.01
+  weight_rank: 0.01
+  weight_null_gain: 0.0  # Stage-1 default; Stage 2 overrides this to 0.30.
+
+  delta_intermediate_weight: 0.30
+  delta_rank_margin: 0.20
+  null_gain_margin: 0.05
+  null_gain_topk: 0.20
+  null_gain_temp: 0.50
+  eval_null_gain_metric: true
+
+inference:
+  matching_pool_size: 32
+  edit_eval_wrapper: 'tmr'
+  source_cond_scale: 1.0
+  edit_cond_scale: 2.0
+
+tmr:
+  root: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/TMR'
+  run_dir: '/mnt/c/Users/USER/Desktop/Tzu-Hsuan/TMR/models/tmr_humanml3d_guoh3dfeats'
+  ckpt_name: 'last'
+  input_is_normalized: true
