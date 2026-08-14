@@ -327,7 +327,7 @@ Application 是 Flask + Three.js 的互動展示平台，可在瀏覽器執行�
 
 ```bash
 cd Application
-CKPT=best.tar python server.py
+CKPT=high_g2t_e082_s10306_r1_0.4625.tar python server.py
 ```
 
 > [!TIP]
