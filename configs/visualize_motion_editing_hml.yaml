@@ -2,7 +2,7 @@ trans_cfg: './configs/train_vqmotion_hml.yaml'
 visual_cfg: './utils/visual_config.yaml'
 
 # Checkpoint filename inside <root_ckpt_dir>/humanml3d/VQMotion/model/
-ckpt: 'best_45_1.tar'
+ckpt: 'best.tar'
 
 # Data selection
 split: 'test'
@@ -11,7 +11,7 @@ num_samples: 4
 start_index: 0
 random_select: True
 motionfix_start_id: 400000
-seed: 13475
+seed: 15211
 # Sampling
 time_steps: 20
 cond_scale: 2
