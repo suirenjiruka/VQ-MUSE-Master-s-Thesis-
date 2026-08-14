@@ -54,7 +54,7 @@ cd VQMotion
 conda create -n vqmotion python=3.11 -y
 conda activate vqmotion
 
-pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install "torch==2.4.1+cu121" --extra-index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
 ```
 
