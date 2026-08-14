@@ -36,7 +36,7 @@ VQMotion 是一套以 **Hierarchical Residual VQ-VAE（HRVQ-VAE）** 表示人�
 ### 1.1 取得程式（Clone repository）
 
 ```bash
-git clone <REPOSITORY_URL> VQMotion
+git clone https://github.com/suirenjiruka/VQ-MUSE-Master-s-Thesis-.git VQMotion
 cd VQMotion
 ```
 
@@ -320,7 +320,7 @@ Application 是 Flask + Three.js 的互動展示平台，可在瀏覽器執行�
 
 ### 5.1 準備與啟動
 
-**下載：** [SMPL model package](https://drive.google.com/file/d/1o0q80GeV6zZjx5CUahLB-EwV25mYJaQ2/view?usp=drive_link)，解壓到 `visualize/smpl_models/`。
+**同第4章下載：** [SMPL model package](https://drive.google.com/file/d/1o0q80GeV6zZjx5CUahLB-EwV25mYJaQ2/view?usp=drive_link)，解壓到 `visualize/smpl_models/`。
 
 > [!IMPORTANT]
 > Application 預設使用 `MESH_MODE=own`，因此必須準備 `visualize/smpl_models/smplx/SMPLX_MALE.npz`，並確認 [utils/visual_config.yaml](utils/visual_config.yaml) 的 `SMPL_MODEL_DIR` 指向 `./visualize/smpl_models/`。若只使用 `MESH_MODE=joints`，則不需要 SMPL model package。
